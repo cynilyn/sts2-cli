@@ -3191,7 +3191,7 @@ public class RunSimulator
         // Patch TalkCmd.Play to a no-op (issue #64). Monster speech-bubble VFX during
         // moves (e.g. BygoneEffigy.WakeMove) NRE in headless and break the enemy turn.
         PatchTalkCmd();
-        PatchSoulNexusAfterDeath();
+        PatchMonsterDeathHooks();
 
         // Initialize localization system (needed for events, cards, etc.)
         InitLocManager();
@@ -3328,34 +3328,43 @@ public class RunSimulator
     }
 
     /// <summary>
-    /// SoulNexus.AfterDeath unsubscribes from Died and then plays a death animation through
-    /// NCombatRoom.Instance.GetCreatureNode(..) without a null check on Instance (BeforeRemovedFromRoom
-    /// does check it). There is no combat room in headless, so killing it with an end-of-turn effect
-    /// (e.g. a Lightning orb) throws inside the enemy turn, kills the combat turn loop and ends in the
-    /// EndTurn nuclear game_over fallback. The animation is cosmetic, so swallow only the NRE.
+    /// Monster death hooks (BeforeDeath / AfterDeath / OnDieToDoom) mix gameplay with cosmetics such as
+    /// audio and death animations. Several call NAudioManager.Instance / NCombatRoom.Instance without a
+    /// null check (e.g. Crusher.BeforeDeath, Rocket.BeforeDeath, SoulNexus.AfterDeath); neither exists in
+    /// headless, so killing the monster with an end-of-turn effect (a Lightning orb, poison) throws inside
+    /// the enemy turn, kills the combat turn loop and ends in the EndTurn nuclear game_over fallback.
+    /// Swallow only NullReferenceException in those hooks and log where it happened.
     /// </summary>
-    private static void PatchSoulNexusAfterDeath()
+    private static void PatchMonsterDeathHooks()
     {
         try
         {
-            var type = typeof(CombatManager).Assembly.GetType("MegaCrit.Sts2.Core.Models.Monsters.SoulNexus");
-            var method = type?.GetMethod("AfterDeath",
-                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public
-                | System.Reflection.BindingFlags.DeclaredOnly,
-                null, new[] { typeof(Creature) }, null);
-            var finalizer = typeof(YieldPatches).GetMethod(nameof(YieldPatches.SwallowNullReferenceFinalizer),
-                System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public);
-            if (method == null || finalizer == null)
+            var harmony = new Harmony("sts2headless.deathhooks");
+            var names = new HashSet<string> { "BeforeDeath", "AfterDeath", "OnDieToDoom" };
+            var flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic
+                | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.DeclaredOnly;
+            var voidFinalizer = new HarmonyMethod(typeof(YieldPatches).GetMethod(nameof(YieldPatches.SwallowNreVoid))!);
+            var taskFinalizer = new HarmonyMethod(typeof(YieldPatches).GetMethod(nameof(YieldPatches.SwallowNreTask))!);
+            int patched = 0;
+            Type?[] allTypes;
+            try { allTypes = typeof(CombatManager).Assembly.GetTypes(); }
+            catch (System.Reflection.ReflectionTypeLoadException rtle) { allTypes = rtle.Types; }   // some types reference Godot types the stubs lack
+            foreach (var type in allTypes.Where(t => t != null && t.Namespace == "MegaCrit.Sts2.Core.Models.Monsters").Select(t => t!))
             {
-                Console.Error.WriteLine("[WARN] Could not find SoulNexus.AfterDeath to patch");
-                return;
+                foreach (var m in type.GetMethods(flags).Where(m => names.Contains(m.Name) && !m.IsAbstract))
+                {
+                    HarmonyMethod? fin = m.ReturnType == typeof(void) ? voidFinalizer
+                        : m.ReturnType == typeof(Task) ? taskFinalizer : null;
+                    if (fin == null) continue;
+                    try { harmony.Patch(m, finalizer: fin); patched++; }
+                    catch (Exception ex) { Console.Error.WriteLine($"[WARN] Could not patch {type.Name}.{m.Name}: {ex.Message}"); }
+                }
             }
-            new Harmony("sts2headless.soulnexus").Patch(method, finalizer: new HarmonyMethod(finalizer));
-            Console.Error.WriteLine("[INFO] Patched SoulNexus.AfterDeath (swallow cosmetic NRE when no combat room)");
+            Console.Error.WriteLine($"[INFO] Patched {patched} monster death hooks (swallow cosmetic NRE when no combat room/audio)");
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"[WARN] Failed to patch SoulNexus.AfterDeath: {ex.Message}");
+            Console.Error.WriteLine($"[WARN] Failed to patch monster death hooks: {ex.Message}");
         }
     }
 
@@ -3567,10 +3576,21 @@ public class RunSimulator
             return false; // Skip original method
         }
 
-        /// <summary>Harmony finalizer: drop NullReferenceException from purely cosmetic headless-only failures.</summary>
-        public static Exception? SwallowNullReferenceFinalizer(Exception? __exception)
+        /// <summary>Harmony finalizer (void hooks): drop NullReferenceException from headless-only cosmetic failures.</summary>
+        public static Exception? SwallowNreVoid(Exception? __exception, System.Reflection.MethodBase __originalMethod)
         {
-            return __exception is NullReferenceException ? null : __exception;
+            if (__exception is not NullReferenceException) return __exception;
+            Console.Error.WriteLine($"[SIM] swallowed NRE in {__originalMethod.DeclaringType?.Name}.{__originalMethod.Name}");
+            return null;
+        }
+
+        /// <summary>Harmony finalizer (Task-returning hooks): as above, and hand back a completed Task.</summary>
+        public static Exception? SwallowNreTask(Exception? __exception, ref Task __result, System.Reflection.MethodBase __originalMethod)
+        {
+            if (__exception is not NullReferenceException) return __exception;
+            Console.Error.WriteLine($"[SIM] swallowed NRE in {__originalMethod.DeclaringType?.Name}.{__originalMethod.Name}");
+            __result = Task.CompletedTask;
+            return null;
         }
     }
 
