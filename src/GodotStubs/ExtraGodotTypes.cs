@@ -122,6 +122,7 @@ public static class Colors
     public static Color White { get; } = Color.White;
     public static Color Black { get; } = Color.Black;
     public static Color Red { get; } = new(1, 0, 0);
+    public static Color DarkRed { get; } = new(0.55f, 0, 0);
     public static Color Green { get; } = new(0, 1, 0);
     public static Color Blue { get; } = new(0, 0, 1);
     public static Color Yellow { get; } = new(1, 1, 0);

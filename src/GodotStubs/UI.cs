@@ -6,6 +6,8 @@ public class CanvasItem : Node
     public Color Modulate { get; set; } = Color.White;
     public Color SelfModulate { get; set; } = Color.White;
     public void SetSelfModulate(Color value) => SelfModulate = value;
+    public void SetVisible(bool value) => Visible = value;
+    public Material? Material { get; set; }
     public bool Visible { get; set; } = true;
     public virtual void Show() => Visible = true;
     public virtual void Hide() => Visible = false;
@@ -40,6 +42,11 @@ public class Control : CanvasItem
     public Vector2 Scale { get; set; } = Vector2.One;
     public Vector2 PivotOffset { get; set; }
     public FocusModeEnum FocusMode { get; set; }
+    public void SetFocusMode(FocusModeEnum mode) => FocusMode = mode;
+    public NodePath FocusNeighborTop { get; set; } = new NodePath("");
+    public NodePath FocusNeighborBottom { get; set; } = new NodePath("");
+    public NodePath FocusNeighborLeft { get; set; } = new NodePath("");
+    public NodePath FocusNeighborRight { get; set; } = new NodePath("");
     public MouseFilterEnum MouseFilter { get; set; }
     public string TooltipText { get; set; } = "";
 

@@ -9,6 +9,11 @@ public class GodotObject
     public static bool IsInstanceValid(GodotObject? obj) => obj != null;
     public virtual bool IsQueuedForDeletion() => false;
 
+    // Signals and deferred calls have no observers/main loop in headless; no-ops keep game logic running.
+    public Error Connect(StringName signal, Callable callable, uint flags = 0) => Error.Ok;
+    public void Disconnect(StringName signal, Callable callable) { }
+    public Variant CallDeferred(StringName method, params Variant[] args) => default;
+
     // ToSignal - must be on GodotObject (not Node) to match real Godot
     public SignalAwaiter ToSignal(GodotObject source, StringName signal)
     {
@@ -50,6 +55,18 @@ public class Node : GodotObject
     public virtual StringName Name { get; set; } = "";
 
     public Node? GetParent() => _parent;
+
+    public NodePath GetPath() => new NodePath(Name?.ToString() ?? "");
+
+    public Node? GetNodeOrNull(NodePath path) => null;
+
+    public void Reparent(Node newParent, bool keepGlobalTransform = true)
+    {
+        if (_parent == newParent) return;
+        _parent?._children.Remove(this);
+        _parent = newParent;
+        newParent._children.Add(this);
+    }
 
     public int GetIndex(bool includeInternal = false) => _parent == null ? -1 : _parent._children.IndexOf(this);
 
