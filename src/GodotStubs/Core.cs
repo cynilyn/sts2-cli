@@ -51,6 +51,8 @@ public class Node : GodotObject
 
     public Node? GetParent() => _parent;
 
+    public int GetIndex(bool includeInternal = false) => _parent == null ? -1 : _parent._children.IndexOf(this);
+
     public Godot.Collections.Array<Node> GetChildren(bool includeInternal = false)
     {
         return new Godot.Collections.Array<Node>(_children);

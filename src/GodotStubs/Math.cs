@@ -121,6 +121,7 @@ public static class Mathf
     public static float Cos(float s) => MathF.Cos(s);
     public static float Tan(float s) => MathF.Tan(s);
     public static float Sqrt(float s) => MathF.Sqrt(s);
+    public static float Log(float s) => MathF.Log(s);
     public static float Pow(float @base, float exp) => MathF.Pow(@base, exp);
     public static float Abs(float s) => MathF.Abs(s);
     public static float Floor(float s) => MathF.Floor(s);

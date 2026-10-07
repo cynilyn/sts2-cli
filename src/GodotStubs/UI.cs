@@ -5,6 +5,7 @@ public class CanvasItem : Node
 {
     public Color Modulate { get; set; } = Color.White;
     public Color SelfModulate { get; set; } = Color.White;
+    public void SetSelfModulate(Color value) => SelfModulate = value;
     public bool Visible { get; set; } = true;
     public virtual void Show() => Visible = true;
     public virtual void Hide() => Visible = false;
