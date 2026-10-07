@@ -4,7 +4,8 @@
     <TargetFramework>net9.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <RollForward>LatestMajor</RollForward>
+    <!-- Harmony (game lib 0Harmony.dll) does not support CoreCLR 10: with LatestMajor every Harmony patch silently failed ("CoreCLR version 10.0.11 is not supported") when a .NET 10 runtime is installed. Stay on the 9.x runtime. -->
+    <RollForward>Minor</RollForward>
   </PropertyGroup>
 
   <ItemGroup>

@@ -3191,6 +3191,7 @@ public class RunSimulator
         // Patch TalkCmd.Play to a no-op (issue #64). Monster speech-bubble VFX during
         // moves (e.g. BygoneEffigy.WakeMove) NRE in headless and break the enemy turn.
         PatchTalkCmd();
+        PatchSoulNexusAfterDeath();
 
         // Initialize localization system (needed for events, cards, etc.)
         InitLocManager();
@@ -3323,6 +3324,38 @@ public class RunSimulator
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[WARN] Failed to patch Cmd.Wait: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// SoulNexus.AfterDeath unsubscribes from Died and then plays a death animation through
+    /// NCombatRoom.Instance.GetCreatureNode(..) without a null check on Instance (BeforeRemovedFromRoom
+    /// does check it). There is no combat room in headless, so killing it with an end-of-turn effect
+    /// (e.g. a Lightning orb) throws inside the enemy turn, kills the combat turn loop and ends in the
+    /// EndTurn nuclear game_over fallback. The animation is cosmetic, so swallow only the NRE.
+    /// </summary>
+    private static void PatchSoulNexusAfterDeath()
+    {
+        try
+        {
+            var type = typeof(CombatManager).Assembly.GetType("MegaCrit.Sts2.Core.Models.Monsters.SoulNexus");
+            var method = type?.GetMethod("AfterDeath",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public
+                | System.Reflection.BindingFlags.DeclaredOnly,
+                null, new[] { typeof(Creature) }, null);
+            var finalizer = typeof(YieldPatches).GetMethod(nameof(YieldPatches.SwallowNullReferenceFinalizer),
+                System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public);
+            if (method == null || finalizer == null)
+            {
+                Console.Error.WriteLine("[WARN] Could not find SoulNexus.AfterDeath to patch");
+                return;
+            }
+            new Harmony("sts2headless.soulnexus").Patch(method, finalizer: new HarmonyMethod(finalizer));
+            Console.Error.WriteLine("[INFO] Patched SoulNexus.AfterDeath (swallow cosmetic NRE when no combat room)");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WARN] Failed to patch SoulNexus.AfterDeath: {ex.Message}");
         }
     }
 
@@ -3532,6 +3565,12 @@ public class RunSimulator
         {
             __result = null;
             return false; // Skip original method
+        }
+
+        /// <summary>Harmony finalizer: drop NullReferenceException from purely cosmetic headless-only failures.</summary>
+        public static Exception? SwallowNullReferenceFinalizer(Exception? __exception)
+        {
+            return __exception is NullReferenceException ? null : __exception;
         }
     }
 
