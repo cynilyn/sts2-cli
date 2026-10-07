@@ -1031,6 +1031,31 @@ public class RunSimulator
         return p?.PlayerCombatState?.Phase == MegaCrit.Sts2.Core.Combat.PlayerTurnPhase.Play;
     }
 
+    private bool SelectionPending() =>
+        _cardSelector.HasPending || _cardSelector.HasPendingReward || _pendingBundles != null;
+
+    /// <summary>
+    /// After the caller answered an enemy-turn selection, let the rest of the enemy turn run so the next
+    /// decision is the player's turn (or the combat result) instead of a half-finished enemy turn.
+    /// </summary>
+    private void WaitForEnemyTurnToFinish(Player player, int maxMs = 8000)
+    {
+        if (!CombatManager.Instance.IsInProgress || IsPlayPhase() || player.Creature.IsDead) return;
+        YieldPatches.SuppressYield = true;
+        try
+        {
+            var deadline = Environment.TickCount64 + maxMs;
+            while (Environment.TickCount64 < deadline)
+            {
+                _syncCtx.Pump();
+                if (!CombatManager.Instance.IsInProgress || IsPlayPhase() || player.Creature.IsDead) break;
+                if (SelectionPending()) break;
+                Thread.Sleep(5);
+            }
+        }
+        finally { YieldPatches.SuppressYield = false; }
+    }
+
     private Dictionary<string, object?> DoEndTurn(Player player)
     {
         // A pending card / card-reward / bundle selection is an unresolved prompt; ending
@@ -1085,6 +1110,7 @@ public class RunSimulator
                     if (_turnStarted.IsSet || _combatEnded.IsSet) break;
                     if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
                     if (IsPlayPhase()) break;
+                    if (SelectionPending()) break;
                     Thread.Sleep(5);
                 }
             }
@@ -1092,6 +1118,15 @@ public class RunSimulator
         finally
         {
             YieldPatches.SuppressYield = false;
+        }
+
+        // Some enemy-turn mechanics (e.g. Knowledge Demon) ask the player to choose a card. That is a
+        // prompt for the caller, not a deadlock: surface it instead of cancelling the action below.
+        // The caller answers with select_cards / skip_select and the enemy turn is finished there.
+        if (SelectionPending() && CombatManager.Instance.IsInProgress && !player.Creature.IsDead)
+        {
+            Log("end_turn: enemy-turn selection pending, surfacing it to the caller");
+            return DetectDecisionPoint();
         }
 
         // Second fallback: if still stuck after SuppressYield window, cancel and retry.
@@ -1127,10 +1162,17 @@ public class RunSimulator
                     if (_turnStarted.IsSet || _combatEnded.IsSet) break;
                     if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
                     if (IsPlayPhase()) break;
+                    if (SelectionPending()) break;
                     Thread.Sleep(10);
                 }
             }
             catch (Exception ex) { Log($"Cancel retry: {ex.Message}"); }
+
+            if (SelectionPending() && CombatManager.Instance.IsInProgress && !player.Creature.IsDead)
+            {
+                Log("end_turn: enemy-turn selection pending after retry, surfacing it to the caller");
+                return DetectDecisionPoint();
+            }
 
             // NUCLEAR OPTION: If STILL stuck after 2 attempts, use ThreadPool to force
             // the enemy turn processing to complete with SuppressYield permanently on.
@@ -1445,6 +1487,7 @@ public class RunSimulator
         _cardSelector.ResolvePendingByIndices(indices);
         _syncCtx.Pump();
         WaitForActionExecutor();
+        WaitForEnemyTurnToFinish(player);
 
         // Extra wait for rest-site SMITH: the background ChooseLocalOption task
         // needs time to complete the upgrade after card selection resolves.
@@ -1508,6 +1551,7 @@ public class RunSimulator
             _cardSelector.CancelPending();
             _syncCtx.Pump();
             WaitForActionExecutor();
+            WaitForEnemyTurnToFinish(player);
         }
         return DetectDecisionPoint();
     }
