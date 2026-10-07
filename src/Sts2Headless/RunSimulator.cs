@@ -1468,7 +1468,36 @@ public class RunSimulator
             Log("Card selection in shop (card removal), refreshing shop state");
         }
 
+        // Extra wait for events (e.g. Neow "New Leaf" transform): the event's completion is
+        // published by a continuation that may not have run yet, so snapshotting right away can
+        // re-export the stale page. Same pattern as the rest-site and shop waits above.
+        if (_runState?.CurrentRoom is EventRoom)
+            WaitForEventToSettle();
+
         return DetectDecisionPoint();
+    }
+
+    private void WaitForEventToSettle(int maxMs = 500)
+    {
+        try
+        {
+            var ev = RunManager.Instance.EventSynchronizer?.GetLocalEvent();
+            if (ev == null || ev.IsFinished) return;
+            string Key() => string.Join("|", ev.CurrentOptions?.Select(o => o.TextKey) ?? Enumerable.Empty<string?>());
+            var before = Key();
+            var deadline = Environment.TickCount64 + maxMs;
+            while (Environment.TickCount64 < deadline)
+            {
+                _syncCtx.Pump();
+                if (ev.IsFinished) break;
+                if (_cardSelector.HasPending || _cardSelector.HasPendingReward || _pendingBundles != null) return;
+                if (_runState?.CurrentRoom is not EventRoom) break;
+                if (Key() != before) break;
+                Thread.Sleep(5);
+            }
+            WaitForActionExecutor();
+        }
+        catch (Exception ex) { Log($"WaitForEventToSettle: {ex.Message}"); }
     }
 
     private Dictionary<string, object?> DoSkipSelect(Player player)
