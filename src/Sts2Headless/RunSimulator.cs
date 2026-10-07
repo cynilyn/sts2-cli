@@ -2976,6 +2976,8 @@ public class RunSimulator
                 {
                     _syncCtx.Pump();
                     if (!executor.IsRunning) break;
+                    // A selection raised while we wait is a prompt for the caller, not a busy executor.
+                    if (_cardSelector.HasPending || _cardSelector.HasPendingReward) break;
                     Thread.Sleep(1);
                 }
             }
@@ -3472,9 +3474,13 @@ public class RunSimulator
 
         public void ResolvePending(IEnumerable<CardModel> selected)
         {
-            _pendingTcs?.TrySetResult(selected);
+            // Clear first, then complete: TrySetResult runs the game's continuation synchronously, and that
+            // continuation may immediately ask for another selection (e.g. Echo Form replaying Hologram).
+            // Clearing afterwards wiped that new prompt, leaving the action queue blocked on a hidden selection.
+            var tcs = _pendingTcs;
             PendingOptions = null;
             _pendingTcs = null;
+            tcs?.TrySetResult(selected);
         }
 
         public void ResolvePendingByIndices(int[] indices)
@@ -3489,9 +3495,10 @@ public class RunSimulator
 
         public void CancelPending()
         {
-            _pendingTcs?.TrySetResult(Array.Empty<CardModel>());
+            var tcs = _pendingTcs;   // same ordering as ResolvePending
             PendingOptions = null;
             _pendingTcs = null;
+            tcs?.TrySetResult(Array.Empty<CardModel>());
         }
 
         // Pending card reward from events (GetSelectedCardReward blocks until resolved)
