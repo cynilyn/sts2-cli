@@ -444,10 +444,18 @@ public class RunSimulator
                 {
                     var id = cEl.GetString();
                     if (id == null) continue;
+                    // "BASH+" = upgraded Bash (deck snapshots from real runs include upgrades).
+                    var upgraded = id.EndsWith("+");
+                    if (upgraded) id = id.TrimEnd('+');
                     var canonical = ModelDb.GetById<CardModel>(new ModelId("CARD", id));
                     if (canonical != null)
                     {
                         var card = _runState.CreateCard(canonical, player);
+                        if (upgraded && card.IsUpgradable)
+                        {
+                            card.UpgradeInternal();
+                            card.FinalizeUpgradeInternal();
+                        }
                         player.Deck.AddInternal(card, silent: true);
                     }
                 }
@@ -1137,6 +1145,10 @@ public class RunSimulator
         var p = (_runState != null && _runState.Players.Count > 0) ? _runState.Players[0] : null;
         return p?.PlayerCombatState?.Phase == MegaCrit.Sts2.Core.Combat.PlayerTurnPhase.Play;
     }
+
+    private static List<string> PileIds(IEnumerable<CardModel>? cards) =>
+        (cards ?? Enumerable.Empty<CardModel>()).Where(c => c != null)
+            .Select(c => c.Id.Entry + (c.IsUpgraded ? "+" : "")).OrderBy(x => x, StringComparer.Ordinal).ToList();
 
     private static int CardPlaysStartedCount()
     {
@@ -2412,6 +2424,7 @@ public class RunSimulator
                 ["cost"] = c.EnergyCost?.GetResolved() ?? 0,
                 ["type"] = c.Type.ToString(),
                 ["rarity"] = c.Rarity.ToString(),
+                ["upgraded"] = c.IsUpgraded,
                 ["can_play"] = c.CanPlay(out _, out _),
                 ["target_type"] = c.TargetType.ToString(),
                 ["stats"] = stats.Count > 0 ? stats : null,
@@ -2535,6 +2548,11 @@ public class RunSimulator
             ["player_powers"] = playerPowers?.Count > 0 ? playerPowers : null,
             ["draw_pile_count"] = pcs?.DrawPile?.Cards?.Count ?? 0,
             ["discard_pile_count"] = pcs?.DiscardPile?.Cards?.Count ?? 0,
+            // Pile contents as sorted ids ("BASH+" = upgraded). Sorted so the draw ORDER stays hidden; the
+            // contents themselves are visible to a human player in the real game.
+            ["draw_pile"] = PileIds(pcs?.DrawPile?.Cards),
+            ["discard_pile"] = PileIds(pcs?.DiscardPile?.Cards),
+            ["exhaust_pile"] = PileIds(pcs?.ExhaustPile?.Cards),
         };
 
         // Character-specific mechanics
@@ -3235,6 +3253,7 @@ public class RunSimulator
                 try { foreach (var dv in r.DynamicVars.Values) vars[dv.Name] = (int)dv.BaseValue; } catch { }
                 return new Dictionary<string, object?>
                 {
+                    ["id"] = r.Id.Entry,
                     ["name"] = _loc.Relic(r.Id.Entry),
                     ["description"] = _loc.Bilingual("relics", r.Id.Entry + ".description"),
                     ["vars"] = vars.Count > 0 ? vars : null,
@@ -3248,6 +3267,7 @@ public class RunSimulator
                 return new Dictionary<string, object?>
                 {
                     ["index"] = i,
+                    ["id"] = p.Id.Entry,
                     ["name"] = _loc.Potion(p.Id.Entry),
                     ["description"] = _loc.Bilingual("potions", p.Id.Entry + ".description"),
                     ["vars"] = pvars.Count > 0 ? pvars : null,
