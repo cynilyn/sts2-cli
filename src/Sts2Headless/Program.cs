@@ -39,8 +39,23 @@ class Program
         return Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "lib"));
     }
 
+    /// <summary>
+    /// Windows wakes sleeping threads on its scheduler tick, 64Hz by default, so Sleep(1), Sleep(5) and
+    /// Sleep(10) all really take ~15.6ms and the engine's iteration-count wait loops run up to ~15x longer
+    /// than intended. timeBeginPeriod(1) raises the tick to 1kHz for this process; since Windows 10 2004
+    /// the request is per-process, so the engine must ask for itself (the Python host asking does not help).
+    /// Ported from Zaaacqwq/sts2-cli fa56e7d.
+    /// </summary>
+    [System.Runtime.InteropServices.DllImport("winmm.dll", EntryPoint = "timeBeginPeriod")]
+    private static extern uint TimeBeginPeriod(uint period);
+
     static void Main(string[] args)
     {
+        if (OperatingSystem.IsWindows())
+        {
+            try { TimeBeginPeriod(1); } catch { /* timer precision is an optimisation, not a requirement */ }
+        }
+
         // Prevent unhandled exceptions from crashing the process
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>
         {

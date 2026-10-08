@@ -3018,9 +3018,11 @@ public class RunSimulator
             var executor = RunManager.Instance.ActionExecutor;
             if (executor.IsRunning)
             {
-                // Pump while waiting for executor
-                int maxPumps = 1000;
-                for (int i = 0; i < maxPumps; i++)
+                // Pump while waiting for the executor, bounded by wall-clock time (1s) rather than an
+                // iteration count: 1000 x Sleep(1) was meant as ~1s but took ~15.6s under Windows' default
+                // timer tick. Ported from Zaaacqwq/sts2-cli 5eef59f.
+                var deadline = System.Diagnostics.Stopwatch.StartNew();
+                while (deadline.ElapsedMilliseconds < 1000)
                 {
                     _syncCtx.Pump();
                     if (!executor.IsRunning) break;
