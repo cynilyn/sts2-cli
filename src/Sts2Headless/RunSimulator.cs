@@ -1483,6 +1483,11 @@ public class RunSimulator
             .Where(i => i >= 0)
             .ToArray();
 
+        var optionCount = _cardSelector.PendingOptions?.Count ?? 0;
+        var validCount = indices.Where(i => i < optionCount).Distinct().Count();
+        if (validCount < _cardSelector.PendingMinSelect)
+            return Error($"select_cards needs at least {_cardSelector.PendingMinSelect} valid index(es), got {validCount}");
+
         Log($"Card selection: indices [{string.Join(",", indices)}]");
         _cardSelector.ResolvePendingByIndices(indices);
         _syncCtx.Pump();
@@ -1545,6 +1550,8 @@ public class RunSimulator
 
     private Dictionary<string, object?> DoSkipSelect(Player player)
     {
+        if (_cardSelector.HasPending && _cardSelector.PendingMinSelect > 0)
+            return Error($"This selection cannot be skipped (min_select={_cardSelector.PendingMinSelect}); use select_cards");
         if (_cardSelector.HasPending)
         {
             Log("Skipping card selection");
@@ -3193,6 +3200,7 @@ public class RunSimulator
         // Patch TalkCmd.Play to a no-op (issue #64). Monster speech-bubble VFX during
         // moves (e.g. BygoneEffigy.WakeMove) NRE in headless and break the enemy turn.
         PatchTalkCmd();
+        PatchChooseACardScreen();
         PatchMonsterDeathHooks();
 
         // Initialize localization system (needed for events, cards, etc.)
@@ -3370,6 +3378,36 @@ public class RunSimulator
         }
     }
 
+    /// <summary>
+    /// CardSelectCmd.FromChooseACardScreen(..., canSkip = false) passes canSkip only to the UI screen; the
+    /// headless Selector path calls GetSelectedCards(cards, 0, 1) and drops it. A prompt the real game does
+    /// not let you skip (e.g. Knowledge Demon's Curse of Knowledge) was therefore reported as min_select=0
+    /// and skip_select declined the curse. Latch canSkip for the duration of the synchronous call so the
+    /// selector can report min_select=1 and reject skip_select; the postfix clears it so nothing leaks into
+    /// unrelated selections.
+    /// </summary>
+    private static void PatchChooseACardScreen()
+    {
+        try
+        {
+            var method = typeof(CardSelectCmd).GetMethod("FromChooseACardScreen",
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+            if (method == null)
+            {
+                Console.Error.WriteLine("[WARN] Could not find CardSelectCmd.FromChooseACardScreen to patch");
+                return;
+            }
+            new Harmony("sts2headless.chooseacard").Patch(method,
+                prefix: new HarmonyMethod(typeof(YieldPatches).GetMethod(nameof(YieldPatches.ChooseACardPrefix))),
+                postfix: new HarmonyMethod(typeof(YieldPatches).GetMethod(nameof(YieldPatches.ChooseACardPostfix))));
+            Console.Error.WriteLine("[INFO] Patched CardSelectCmd.FromChooseACardScreen (honor canSkip=false)");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WARN] Failed to patch FromChooseACardScreen: {ex.Message}");
+        }
+    }
+
     private static void PatchTalkCmd()
     {
         try
@@ -3449,9 +3487,15 @@ public class RunSimulator
 
         public bool HasPending => _pendingTcs != null && !_pendingTcs.Task.IsCompleted;
 
+        /// <summary>True when the pending prompt cannot be skipped in the real game (latched at registration).</summary>
+        public bool PendingForced { get; private set; }
+
         public Task<IEnumerable<CardModel>> GetSelectedCards(
             IEnumerable<CardModel> options, int minSelect, int maxSelect)
         {
+            var forced = YieldPatches.ChooseACardForced;
+            YieldPatches.ChooseACardForced = false;
+            if (forced && minSelect < 1) minSelect = 1;
             var optList = options.ToList();
             if (optList.Count == 0)
                 return Task.FromResult<IEnumerable<CardModel>>(Array.Empty<CardModel>());
@@ -3464,6 +3508,7 @@ public class RunSimulator
             PendingOptions = optList;
             PendingMinSelect = minSelect;
             PendingMaxSelect = maxSelect;
+            PendingForced = forced;
             _pendingTcs = new TaskCompletionSource<IEnumerable<CardModel>>();
 
             Console.Error.WriteLine($"[SIM] Card selection pending: {optList.Count} options, select {minSelect}-{maxSelect}");
@@ -3550,6 +3595,13 @@ public class RunSimulator
 
     internal static class YieldPatches
     {
+        /// <summary>Set while CardSelectCmd.FromChooseACardScreen(canSkip: false) runs its synchronous part.</summary>
+        [ThreadStatic] public static bool ChooseACardForced;
+
+        public static void ChooseACardPrefix(bool canSkip) => ChooseACardForced = !canSkip;
+
+        public static void ChooseACardPostfix() => ChooseACardForced = false;
+
         // Only suppress Task.Yield() when this flag is set (during end_turn processing)
         public static volatile bool SuppressYield;
 
