@@ -1105,6 +1105,9 @@ public class RunSimulator
         }
         // All other target types (None, All, etc.) → leave target as null
 
+        if (cardTargetType == TargetType.AnyEnemy && target == null)
+            return Error($"Cannot play card {card.GetType().Name}: no living enemy to target");
+
         // Check if card can be played
         if (!card.CanPlay(out var reason, out var _))
         {
@@ -1130,6 +1133,15 @@ public class RunSimulator
         var unchanged = handAfter.Count == handCountBefore && cardIndex < handAfter.Count && handAfter[cardIndex] == card;
         if (unchanged && CardPlaysStartedCount() <= playsStartedBefore)
         {
+            try
+            {
+                var cs = CombatManager.Instance.DebugOnlyGetState();
+                var all = string.Join("; ", (cs?.Enemies ?? Enumerable.Empty<Creature>()).Select(e =>
+                    $"{e?.Monster?.Id.Entry} alive={e?.IsAlive} hp={e?.CurrentHp} powers=[{string.Join(",", e?.Powers?.Select(p => p.Id.Entry + ":" + p.Amount) ?? Array.Empty<string>())}]"));
+                Log($"DIAG reject {card.Id.Entry} target={(target == null ? "null" : target.Monster?.Id.Entry)} targetType={card.TargetType} " +
+                    $"round={cs?.RoundNumber} phase={pcs.Phase} enemies=[{all}]");
+            }
+            catch (Exception ex) { Log($"DIAG failed: {ex.Message}"); }
             return Error($"Card could not be played (still in hand after action): {card.GetType().Name} [{card.Id}]");
         }
         if (unchanged)
@@ -2431,6 +2443,10 @@ public class RunSimulator
                 ["stats"] = stats.Count > 0 ? stats : null,
                 ["description"] = _loc.Bilingual("cards", c.Id.Entry + ".description"),
             };
+            // A single-target card has nothing to hit while every enemy is down (e.g. Test Subject
+            // between forms: hp 0, not alive, play phase still running) and the game never starts it.
+            if (c.TargetType == TargetType.AnyEnemy && aliveEnemiesForTargeting.Count == 0)
+                cardInfo["can_play"] = false;
             if (starCost > 0)
             {
                 cardInfo["star_cost"] = starCost;
