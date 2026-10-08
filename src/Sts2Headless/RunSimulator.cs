@@ -3320,6 +3320,13 @@ public class RunSimulator
             ["floor"] = _runState.ActFloor,
             ["room_type"] = _runState.CurrentRoom?.RoomType.ToString(),
         };
+        // Encounter id of the current combat room (lets clients reproduce a combat with start_combat).
+        try
+        {
+            if (_runState.CurrentRoom is CombatRoom cr && cr.Encounter != null)
+                ctx["encounter"] = cr.Encounter.Id.Entry;
+        }
+        catch { }
 
         // Boss encounter info — use BossEncounter?.Id?.Entry
         try
