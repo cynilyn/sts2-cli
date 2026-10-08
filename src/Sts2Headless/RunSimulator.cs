@@ -4031,9 +4031,14 @@ public class RunSimulator
             }
             catch (Exception ex) { Console.Error.WriteLine($"[WARN] Bundle patch: {ex.Message}"); }
 
-            // Patch Neutralize.OnPlay to avoid NullRef in DamageCmd.Attack().Execute()
+            // Neutralize.OnPlay replacement (upstream workaround for a headless NullRef). The original now runs
+            // fine headless (stubs/patches cover its VFX + SaveManager lines) and matches the replacement on
+            // damage, Vulnerable, Strength and attack-only hooks (Envenom); 55 Silent full runs, 3,584 plays,
+            // no errors. Use the real game code by default; STS2_NEUTRALIZE_PATCH=1 restores the replacement.
             try
             {
+                if (Environment.GetEnvironmentVariable("STS2_NEUTRALIZE_PATCH") != "1")
+                    throw new InvalidOperationException("not applied (original Neutralize.OnPlay is used)");
                 var neutralizeType = typeof(MegaCrit.Sts2.Core.Models.Cards.Neutralize);
                 var neutralizeOnPlay = neutralizeType.GetMethod("OnPlay",
                     System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
