@@ -270,7 +270,7 @@ public class RunSimulator
     }
 
     private static readonly HashSet<string> HeadlessUnsupportedEvents =
-        new(StringComparer.Ordinal) { "Amalgamator", "CrystalSphere" };
+        new(StringComparer.Ordinal) { "CrystalSphere" };   // Amalgamator: fixed by PatchEventScreenShake
 
     private bool _eventOptionChosen;
     private int _lastEventOptionCount;
@@ -2750,9 +2750,8 @@ public class RunSimulator
         }
 
         // Events whose resolution needs Godot UI: CrystalSphere opens an interactive minigame screen
-        // (NCrystalSphereScreen.ShowScreen + await completion -> NRE or wait forever); Amalgamator removes the
-        // cards and then dereferences NGame.Instance before giving the combined card (deck loses cards).
-        // An agent cannot play them headless, so skip to the map on entry. (Ported from Zaaacqwq 422cad8.)
+        // (NCrystalSphereScreen.ShowScreen + await completion -> NRE or wait forever). An agent cannot play it
+        // headless yet, so skip to the map on entry. (Ported from Zaaacqwq 422cad8; Amalgamator is now fixed.)
         if (HeadlessUnsupportedEvents.Contains(localEvent.GetType().Name))
         {
             Log($"Event {localEvent.GetType().Name} needs Godot UI; auto-skipping in headless");
@@ -3375,6 +3374,7 @@ public class RunSimulator
         // moves (e.g. BygoneEffigy.WakeMove) NRE in headless and break the enemy turn.
         PatchTalkCmd();
         PatchChooseACardScreen();
+        PatchEventScreenShake();
         PatchMonsterDeathHooks();
 
         // Initialize localization system (needed for events, cards, etc.)
@@ -3579,6 +3579,50 @@ public class RunSimulator
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[WARN] Failed to patch FromChooseACardScreen: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Amalgamator (combine 2 Strikes/Defends into Ultimate Strike/Defend) and PunchOff call
+    /// NGame.Instance.ScreenShakeTrauma(...) without a null check. NGame does not exist headless, so the
+    /// event threw right after removing the two cards and never added the combined card (deck lost cards).
+    /// Rewrite only those call sites (in the async state machines) to a null-safe no-op, so the rest of the
+    /// game's event code runs unchanged.
+    /// </summary>
+    private static void PatchEventScreenShake()
+    {
+        try
+        {
+            var asm = typeof(CombatManager).Assembly;
+            var harmony = new Harmony("sts2headless.screenshake");
+            var transpiler = new HarmonyMethod(typeof(YieldPatches).GetMethod(nameof(YieldPatches.ScreenShakeTranspiler)));
+            int patched = 0;
+            foreach (var name in new[] { "MegaCrit.Sts2.Core.Models.Events.Amalgamator", "MegaCrit.Sts2.Core.Models.Events.PunchOff" })
+            {
+                var type = asm.GetType(name);
+                if (type == null) { Console.Error.WriteLine($"[WARN] {name} not found for screen-shake patch"); continue; }
+                var flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public;
+                var targets = type.GetNestedTypes(System.Reflection.BindingFlags.NonPublic)
+                    .Select(t => t.GetMethod("MoveNext", flags))
+                    .Concat(type.GetMethods(flags | System.Reflection.BindingFlags.DeclaredOnly))
+                    .Where(m => m != null);
+                foreach (var m in targets)
+                {
+                    try
+                    {
+                        var body = m!.GetMethodBody()?.GetILAsByteArray();
+                        if (body == null) continue;
+                        harmony.Patch(m, transpiler: transpiler);
+                        patched++;
+                    }
+                    catch (Exception ex) { Console.Error.WriteLine($"[WARN] screen-shake patch {type.Name}.{m!.Name}: {ex.Message}"); }
+                }
+            }
+            Console.Error.WriteLine($"[INFO] Patched NGame.ScreenShakeTrauma call sites in events ({patched} methods scanned)");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WARN] Failed to patch event screen shake: {ex.Message}");
         }
     }
 
@@ -3789,6 +3833,26 @@ public class RunSimulator
         public static void ChooseACardPrefix(bool canSkip) => ChooseACardForced = !canSkip;
 
         public static void ChooseACardPostfix() => ChooseACardForced = false;
+
+        /// <summary>Replace `callvirt NGame.ScreenShakeTrauma(ShakeStrength)` with a static null-safe no-op
+        /// taking the same stack (instance, enum as int).</summary>
+        public static IEnumerable<HarmonyLib.CodeInstruction> ScreenShakeTranspiler(IEnumerable<HarmonyLib.CodeInstruction> instructions)
+        {
+            var safe = typeof(YieldPatches).GetMethod(nameof(SafeScreenShake));
+            foreach (var ci in instructions)
+            {
+                if ((ci.opcode == System.Reflection.Emit.OpCodes.Callvirt || ci.opcode == System.Reflection.Emit.OpCodes.Call)
+                    && ci.operand is System.Reflection.MethodInfo mi && mi.Name == "ScreenShakeTrauma"
+                    && mi.DeclaringType?.Name == "NGame" && mi.GetParameters().Length == 1)
+                {
+                    yield return new HarmonyLib.CodeInstruction(System.Reflection.Emit.OpCodes.Call, safe) { labels = ci.labels, blocks = ci.blocks };
+                }
+                else yield return ci;
+            }
+        }
+
+        /// <summary>Headless has no screen to shake; also tolerates the null NGame.Instance.</summary>
+        public static void SafeScreenShake(object? game, int strength) { }
 
         // Only suppress Task.Yield() when this flag is set (during end_turn processing)
         public static volatile bool SuppressYield;
