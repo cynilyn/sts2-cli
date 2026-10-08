@@ -1531,6 +1531,10 @@ public class RunSimulator
         var entry = entries[idx];
         if (!entry.IsStocked) return Error("Relic already purchased");
         if (player.Gold < entry.Cost) return Error("Not enough gold");
+        // A successful purchase clears the entry's Model; read what the logs need first so logging
+        // can never turn a completed transaction into a reported NullReferenceException.
+        var relicName = entry.Model?.GetType().Name ?? "?";
+        var relicCost = entry.Cost;
 
         try
         {
@@ -1550,12 +1554,12 @@ public class RunSimulator
             }
             if (_cardSelector.HasPending || _cardSelector.HasPendingReward || _pendingBundles != null)
             {
-                Log($"Buy relic {entry.Model.GetType().Name}: yielded for pending selection");
+                Log($"Buy relic {relicName}: yielded for pending selection");
                 return DetectDecisionPoint();
             }
             if (!task.IsCompleted) DrainUntilComplete(task);
             _syncCtx.Pump();
-            Log($"Bought relic: {entry.Model.GetType().Name} for {entry.Cost}g");
+            Log($"Bought relic: {relicName} for {relicCost}g");
         }
         catch (Exception ex) { return Error($"Buy relic failed: {ex.Message}"); }
 
@@ -1577,12 +1581,14 @@ public class RunSimulator
         if (!entry.IsStocked) return Error("Potion already purchased");
         if (player.Gold < entry.Cost) return Error("Not enough gold");
         if (!player.HasOpenPotionSlots) return Error("Potion belt is full");
+        var potionName = entry.Model?.GetType().Name ?? "?";
+        var potionCost = entry.Cost;
 
         try
         {
             entry.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory()).GetAwaiter().GetResult();
             _syncCtx.Pump();
-            Log($"Bought potion: {entry.Model.GetType().Name} for {entry.Cost}g");
+            Log($"Bought potion: {potionName} for {potionCost}g");
         }
         catch (Exception ex)
         {
@@ -2141,6 +2147,10 @@ public class RunSimulator
                 ["cards"] = opts,
                 ["min_select"] = _cardSelector.PendingMinSelect,
                 ["max_select"] = _cardSelector.PendingMaxSelect,
+                // What the selection is for ("upgrade", "remove", "transform", "enchant", "choose", ...)
+                // and the game's own prompt key ("table.ENTRY"), both language independent.
+                ["purpose"] = _cardSelector.PendingPurpose,
+                ["prompt"] = _cardSelector.PendingPrompt,
                 ["player"] = PlayerSummary(player),
             };
         }
@@ -2317,6 +2327,9 @@ public class RunSimulator
             }
         }
 
+        // The whole route (same rows/boss/current_coord as get_map) so a client can plan past the next node.
+        var fullMap = GetFullMap();
+
         return new Dictionary<string, object?>
         {
             ["type"] = "decision",
@@ -2327,6 +2340,12 @@ public class RunSimulator
             ["act"] = _runState.CurrentActIndex + 1,
             ["act_name"] = _loc.Act(_runState.Act?.Id.Entry ?? "OVERGROWTH"),
             ["floor"] = _runState.ActFloor,
+            ["map"] = new Dictionary<string, object?>
+            {
+                ["rows"] = fullMap.GetValueOrDefault("rows"),
+                ["boss"] = fullMap.GetValueOrDefault("boss"),
+                ["current_coord"] = fullMap.GetValueOrDefault("current_coord"),
+            },
         };
     }
 
@@ -2639,6 +2658,7 @@ public class RunSimulator
                 rewardsSet.GenerateWithoutOffering().GetAwaiter().GetResult();
                 var rewards = rewardsSet.Rewards;
                 _syncCtx.Pump();
+                Log($"Post-combat rewards ({combatRoom.RoomType}): {string.Join(", ", rewards.Select(r => r.GetType().Name))}");
 
                 // Auto-collect gold and potions, but present card choices to agent
                 var cardRewards = new List<CardReward>();
@@ -2934,6 +2954,7 @@ public class RunSimulator
             ["type"] = "decision",
             ["decision"] = "event_choice",
             ["context"] = RunContext(),
+            ["event_id"] = localEvent.Id?.ToString() ?? eventEntry,
             ["event_name"] = eventName,
             ["description"] = eventDesc,
             ["options"] = options,
@@ -3007,6 +3028,7 @@ public class RunSimulator
                 return new Dictionary<string, object?>
                 {
                     ["index"] = i,
+                    ["id"] = card?.Id.ToString(),
                     ["name"] = _loc.Card(entry),
                     ["type"] = card?.Type.ToString() ?? "?",
                     ["rarity"] = card?.Rarity.ToString() ?? "?",
@@ -3017,6 +3039,7 @@ public class RunSimulator
                     ["after_upgrade"] = card != null ? GetUpgradedInfo(card) : null,
                     ["cost"] = e.Cost,
                     ["is_stocked"] = e.IsStocked,
+                    ["can_buy"] = e.IsStocked && player.Gold >= e.Cost,
                     ["on_sale"] = e.IsOnSale,
                 };
             }).ToList();
@@ -3024,15 +3047,18 @@ public class RunSimulator
         var relics = inv.RelicEntries.Select((e, i) => new Dictionary<string, object?>
         {
             ["index"] = i,
+            ["id"] = e.Model?.Id.Entry,
             ["name"] = _loc.Relic(e.Model?.Id.Entry ?? "?"),
             ["description"] = _loc.Bilingual("relics", (e.Model?.Id.Entry ?? "?") + ".description"),
             ["cost"] = e.Cost,
             ["is_stocked"] = e.IsStocked,
+            ["can_buy"] = e.IsStocked && player.Gold >= e.Cost,
         }).ToList();
 
         var potions = inv.PotionEntries.Select((e, i) => new Dictionary<string, object?>
         {
             ["index"] = i,
+            ["id"] = e.Model?.Id.Entry,
             ["name"] = _loc.Potion(e.Model?.Id.Entry ?? "?"),
             ["description"] = _loc.Bilingual("potions", (e.Model?.Id.Entry ?? "?") + ".description"),
             ["cost"] = e.Cost,
@@ -3418,6 +3444,7 @@ public class RunSimulator
         // moves (e.g. BygoneEffigy.WakeMove) NRE in headless and break the enemy turn.
         PatchTalkCmd();
         PatchChooseACardScreen();
+        PatchSelectionPurpose();
         PatchEventScreenShake();
         PatchMonsterDeathHooks();
 
@@ -3627,6 +3654,33 @@ public class RunSimulator
     }
 
     /// <summary>
+    /// ICardSelector.GetSelectedCards only receives (options, min, max), so the headless selector cannot tell
+    /// an upgrade from a removal or a transformation. The CardSelectCmd.From* entry points know: latch the
+    /// purpose (and the prefs' prompt key) for the duration of their synchronous part, like canSkip above.
+    /// </summary>
+    private static void PatchSelectionPurpose()
+    {
+        try
+        {
+            var harmony = new Harmony("sts2headless.selectpurpose");
+            var prefix = new HarmonyMethod(typeof(YieldPatches).GetMethod(nameof(YieldPatches.SelectPurposePrefix)));
+            var postfix = new HarmonyMethod(typeof(YieldPatches).GetMethod(nameof(YieldPatches.SelectPurposePostfix)));
+            var count = 0;
+            foreach (var m in typeof(CardSelectCmd).GetMethods(BindingFlags.Public | BindingFlags.Static)
+                         .Where(m => m.Name.StartsWith("From") && m.Name != "FromChooseABundleScreen"))
+            {
+                harmony.Patch(m, prefix: prefix, postfix: postfix);
+                count++;
+            }
+            Console.Error.WriteLine($"[INFO] Patched {count} CardSelectCmd.From* methods (selection purpose)");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WARN] Failed to patch selection purpose: {ex.Message}");
+        }
+    }
+
+    /// <summary>
     /// Amalgamator (combine 2 Strikes/Defends into Ultimate Strike/Defend) and PunchOff call
     /// NGame.Instance.ScreenShakeTrauma(...) without a null check. NGame does not exist headless, so the
     /// event threw right after removing the two cards and never added the combined card (deck lost cards).
@@ -3745,6 +3799,7 @@ public class RunSimulator
         public int PendingMinSelect { get; private set; }
         public int PendingMaxSelect { get; private set; }
         public string PendingPrompt { get; private set; } = "";
+        public string PendingPurpose { get; private set; } = "";
         private TaskCompletionSource<IEnumerable<CardModel>>? _pendingTcs;
 
         public bool HasPending => _pendingTcs != null && !_pendingTcs.Task.IsCompleted;
@@ -3774,6 +3829,8 @@ public class RunSimulator
             PendingMinSelect = minSelect;
             PendingMaxSelect = maxSelect;
             PendingForced = forced;
+            PendingPurpose = YieldPatches.SelectPurpose ?? "other";
+            PendingPrompt = YieldPatches.SelectPromptKey ?? "";
             _pendingTcs = new TaskCompletionSource<IEnumerable<CardModel>>();
 
             Console.Error.WriteLine($"[SIM] Card selection pending: {optList.Count} options, select {minSelect}-{maxSelect}");
@@ -3873,6 +3930,57 @@ public class RunSimulator
     {
         /// <summary>Set while CardSelectCmd.FromChooseACardScreen(canSkip: false) runs its synchronous part.</summary>
         [ThreadStatic] public static bool ChooseACardForced;
+
+        /// <summary>Set while a CardSelectCmd.From* entry point runs its synchronous part (see PatchSelectionPurpose).</summary>
+        [ThreadStatic] public static string? SelectPurpose;
+        [ThreadStatic] public static string? SelectPromptKey;
+
+        private static readonly Dictionary<string, string> SelectPurposes = new()
+        {
+            ["FromDeckForUpgrade"] = "upgrade", ["FromDeckForRemoval"] = "remove",
+            ["FromDeckForTransformation"] = "transform", ["FromDeckForEnchantment"] = "enchant",
+            ["FromDeckGeneric"] = "deck", ["FromChooseACardScreen"] = "choose",
+            ["FromSimpleGrid"] = "grid", ["FromSimpleGridForRewards"] = "grid",
+            ["FromHand"] = "hand", ["FromHandForDiscard"] = "discard",
+            ["FromHandForUpgrade"] = "upgrade", ["FromCombatPile"] = "pile",
+        };
+
+        /// <summary>The outermost From* call wins (FromDeckForUpgrade may delegate to FromSimpleGrid).</summary>
+        public static void SelectPurposePrefix(MethodBase __originalMethod, object[] __args, out bool __state)
+        {
+            __state = false;
+            if (SelectPurpose != null) return;
+            __state = true;
+            SelectPurpose = SelectPurposes.TryGetValue(__originalMethod.Name, out var purpose) ? purpose : "other";
+            SelectPromptKey = null;
+            try
+            {
+                foreach (var a in __args)
+                {
+                    if (a is CardSelectorPrefs prefs)
+                    {
+                        var prompt = prefs.Prompt;
+                        if (prompt != null && !prompt.IsEmpty)
+                        {
+                            SelectPromptKey = prompt.LocTable + "." + prompt.LocEntryKey;
+                            // The generic grid/hand/pile entry points say nothing about the purpose, but the
+                            // shared prompts do ("card_selection.TO_REMOVE" -> "remove").
+                            if (prompt.LocTable == "card_selection" && prompt.LocEntryKey.StartsWith("TO_"))
+                                SelectPurpose = prompt.LocEntryKey.Substring(3).ToLowerInvariant();
+                        }
+                        break;
+                    }
+                }
+            }
+            catch { }
+        }
+
+        public static void SelectPurposePostfix(bool __state)
+        {
+            if (!__state) return;
+            SelectPurpose = null;
+            SelectPromptKey = null;
+        }
 
         public static void ChooseACardPrefix(bool canSkip) => ChooseACardForced = !canSkip;
 
