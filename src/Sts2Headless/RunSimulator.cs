@@ -221,6 +221,10 @@ public class RunSimulator
     // (cross-thread "Collection was modified", nondeterminism). Track at most one and join it before the next
     // command touches game state. Pattern ported from Zaaacqwq/sts2-cli (TrackExternalTask/ResumeExternalTask).
     private Task? _pendingExternalTask;
+    private IDisposable? _cardSelectorScope;
+
+    private void OnTurnStarted(CombatState _) => _turnStarted.Set();
+    private void OnCombatEnded(CombatRoom _) => _combatEnded.Set();
 
     private Task TrackExternalTask(Func<Task> start)
     {
@@ -289,6 +293,11 @@ public class RunSimulator
             _loc.Lang = lang;
             EnsureModelDbInitialized();
 
+            // start_run is a full episode reset: tear down the previous run so one process can run many
+            // seeded episodes (previously the second start_run failed with "State is already set").
+            if (_runState != null || RunManager.Instance.IsInProgress)
+                CleanUp();
+
             var player = CreatePlayer(character);
             if (player == null)
                 return Error($"Unknown character: {character}");
@@ -320,8 +329,10 @@ public class RunSimulator
             Log("Run launched");
 
             // Register event handlers for combat turn transitions
-            CombatManager.Instance.TurnStarted += _ => _turnStarted.Set();
-            CombatManager.Instance.CombatEnded += _ => _combatEnded.Set();
+            CombatManager.Instance.TurnStarted -= OnTurnStarted;
+            CombatManager.Instance.TurnStarted += OnTurnStarted;
+            CombatManager.Instance.CombatEnded -= OnCombatEnded;
+            CombatManager.Instance.CombatEnded += OnCombatEnded;
 
             // Finalize starting relics
             RunManager.Instance.FinalizeStartingRelics().GetAwaiter().GetResult();
@@ -332,7 +343,8 @@ public class RunSimulator
             Log("Entered Act 0");
 
             // Register card selector for cards that need player choice
-            CardSelectCmd.UseSelector(_cardSelector);
+            _cardSelectorScope?.Dispose();
+            _cardSelectorScope = CardSelectCmd.UseSelector(_cardSelector);
             LocPatches._bundleSimRef = this;
 
             // Now we should be at the map — detect decision point
@@ -345,6 +357,36 @@ public class RunSimulator
     }
 
     // ─── Test/Debug commands ───
+
+    /// <summary>Read-only: hand, draw pile (in draw order) and discard pile. For analysis only; exposing the
+    /// draw order to an agent would leak hidden information. Ported from Zaaacqwq/sts2-cli 63f856d.</summary>
+    public Dictionary<string, object?> GetDrawPile()
+    {
+        try
+        {
+            if (_runState == null) return Error("No run in progress");
+            var pcs = _runState.Players[0].PlayerCombatState;
+            if (pcs?.DrawPile == null) return Error("Not in combat");
+
+            static List<Dictionary<string, object?>> Serialize(IEnumerable<CardModel>? cards) =>
+                (cards ?? Enumerable.Empty<CardModel>())
+                    .Select((c, i) => new Dictionary<string, object?>
+                    {
+                        ["index"] = i,
+                        ["id"] = c.Id.Entry,
+                        ["upgraded"] = c.IsUpgraded,
+                    }).ToList();
+
+            return new Dictionary<string, object?>
+            {
+                ["type"] = "ok",
+                ["hand"] = Serialize(pcs.Hand?.Cards),
+                ["draw_pile"] = Serialize(pcs.DrawPile?.Cards),
+                ["discard_pile"] = Serialize(pcs.DiscardPile?.Cards),
+            };
+        }
+        catch (Exception ex) { return ErrorWithTrace("GetDrawPile failed", ex); }
+    }
 
     private static readonly System.Reflection.BindingFlags NonPublic =
         System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
@@ -573,9 +615,12 @@ public class RunSimulator
             RunManager.Instance.SetUpSavedSingleplayer(_runState, save).GetAwaiter().GetResult();
             LocalContext.NetId = netService.NetId;
 
-            CombatManager.Instance.TurnStarted += _ => _turnStarted.Set();
-            CombatManager.Instance.CombatEnded += _ => _combatEnded.Set();
-            CardSelectCmd.UseSelector(_cardSelector);
+            CombatManager.Instance.TurnStarted -= OnTurnStarted;
+            CombatManager.Instance.TurnStarted += OnTurnStarted;
+            CombatManager.Instance.CombatEnded -= OnCombatEnded;
+            CombatManager.Instance.CombatEnded += OnCombatEnded;
+            _cardSelectorScope?.Dispose();
+            _cardSelectorScope = CardSelectCmd.UseSelector(_cardSelector);
             LocPatches._bundleSimRef = this;
 
             var savedRoom = _runState.CurrentRoom;
@@ -2414,6 +2459,7 @@ public class RunSimulator
                 // Enemy powers
                 var ePowers = e.Powers?.Select(pw => new Dictionary<string, object?>
                 {
+                    ["id"] = pw.Id.Entry,
                     ["name"] = _loc.Power(pw.Id.Entry),
                     ["description"] = _loc.Bilingual("powers", pw.Id.Entry + ".description"),
                     ["amount"] = pw.Amount,
@@ -2422,6 +2468,7 @@ public class RunSimulator
                 return new Dictionary<string, object?>
                 {
                     ["index"] = i,
+                    ["id"] = e.Monster?.Id.Entry,
                     ["name"] = _loc.Monster(e.Monster?.Id.Entry ?? "UNKNOWN"),
                     ["hp"] = e.CurrentHp,
                     ["max_hp"] = e.MaxHp,
@@ -2435,6 +2482,7 @@ public class RunSimulator
         // Player powers/buffs
         var playerPowers = player.Creature?.Powers?.Select(pw => new Dictionary<string, object?>
         {
+            ["id"] = pw.Id.Entry,
             ["name"] = _loc.Power(pw.Id.Entry),
             ["description"] = _loc.Bilingual("powers", pw.Id.Entry + ".description"),
             ["amount"] = pw.Amount,
@@ -3634,6 +3682,17 @@ public class RunSimulator
             ResolvePending(selected);
         }
 
+        /// <summary>Run teardown only: forget pending prompts without completing them.</summary>
+        public void AbandonAll()
+        {
+            PendingOptions = null;
+            _pendingTcs = null;
+            PendingForced = false;
+            PendingRewardCards = null;
+            _rewardWait = null;
+            _rewardChoice = -1;
+        }
+
         public void CancelPending()
         {
             var tcs = _pendingTcs;   // same ordering as ResolvePending
@@ -4199,6 +4258,24 @@ public class RunSimulator
     {
         try
         {
+            // Let a tracked background operation finish against the run it belongs to (answer its prompt
+            // with skip/empty), so a thread blocked in GetSelectedCardReward cannot wake up later and touch
+            // the next episode's state.
+            if (_pendingExternalTask is { IsCompleted: false })
+            {
+                if (_cardSelector.HasPendingReward) _cardSelector.ResolveReward(-1);
+                if (_cardSelector.HasPending) _cardSelector.CancelPending();
+                ResumeExternalTask(3000);
+            }
+            _pendingExternalTask = null;
+            _cardSelector.AbandonAll();
+            _pendingRewards = null;
+            _pendingCardReward = null;
+            _pendingBundles = null;
+            _pendingBundleTcs = null;
+            _eventOptionChosen = false;
+            _lastEventOptionCount = 0;
+
             if (RunManager.Instance.IsInProgress)
                 RunManager.Instance.CleanUp(graceful: true);
             _runState = null;

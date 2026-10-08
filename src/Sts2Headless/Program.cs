@@ -192,6 +192,41 @@ class Program
                 return sim.EnterRoom(roomType, encounter, eventId);
             }
 
+            case "start_combat":
+            {
+                // Atomic episode reset for RL: new seeded run -> optional player setup -> encounter -> optional
+                // draw order. Fails closed: the first error is returned unchanged.
+                var r = sim.StartRun(
+                    cmd.TryGetProperty("character", out var sch) ? sch.GetString() ?? "Ironclad" : "Ironclad",
+                    cmd.TryGetProperty("ascension", out var sasc) ? sasc.GetInt32() : 0,
+                    cmd.TryGetProperty("seed", out var sseed) ? sseed.GetString() : null,
+                    cmd.TryGetProperty("lang", out var slang) ? slang.GetString() ?? "en" : "en");
+                if (r != null && Equals(r.GetValueOrDefault("type"), "error")) return r;
+                if (cmd.TryGetProperty("player", out var spl) && spl.ValueKind == JsonValueKind.Object)
+                {
+                    var pargs = new Dictionary<string, JsonElement>();
+                    foreach (var prop in spl.EnumerateObject()) pargs[prop.Name] = prop.Value;
+                    var pr = sim.SetPlayer(pargs);
+                    if (pr != null && Equals(pr.GetValueOrDefault("type"), "error")) return pr;
+                }
+                var encounter = cmd.TryGetProperty("encounter", out var senc) ? senc.GetString() : null;
+                if (string.IsNullOrEmpty(encounter))
+                    return new Dictionary<string, object?> { ["type"] = "error", ["message"] = "start_combat requires 'encounter'" };
+                var er = sim.EnterRoom("combat", encounter, null);
+                if (er != null && Equals(er.GetValueOrDefault("type"), "error")) return er;
+                if (cmd.TryGetProperty("draw_order", out var sdo) && sdo.ValueKind == JsonValueKind.Array)
+                {
+                    var order = new List<string>();
+                    foreach (var c in sdo.EnumerateArray()) order.Add(c.GetString() ?? "");
+                    var dr = sim.SetDrawOrder(order);
+                    if (dr != null && Equals(dr.GetValueOrDefault("type"), "error")) return dr;
+                }
+                return er;
+            }
+
+            case "get_draw_pile":
+                return sim.GetDrawPile();
+
             case "set_draw_order":
             {
                 var cards = new List<string>();
