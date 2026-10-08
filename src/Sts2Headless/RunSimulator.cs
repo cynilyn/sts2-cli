@@ -215,6 +215,9 @@ public class RunSimulator
     private readonly ManualResetEventSlim _turnStarted = new(false);
     private readonly ManualResetEventSlim _combatEnded = new(false);
     private static readonly LocLookup _loc = new();
+    private static readonly HashSet<string> HeadlessUnsupportedEvents =
+        new(StringComparer.Ordinal) { "Amalgamator", "CrystalSphere" };
+
     private bool _eventOptionChosen;
     private int _lastEventOptionCount;
 
@@ -1007,17 +1010,26 @@ public class RunSimulator
         Log($"Playing card {card.GetType().Name} (index {cardIndex}) targeting {(target != null ? target.Monster?.GetType().Name ?? "creature" : "none")}");
 
         var handCountBefore = hand.Count;
+        var playsStartedBefore = CardPlaysStartedCount();
 
         var playAction = new PlayCardAction(card, target);
         RunManager.Instance.ActionQueueSet.EnqueueWithoutSynchronizing(playAction);
         WaitForActionExecutor();
 
-        // Check if card play had no effect (hand unchanged, same card still at same index)
+        // The card opened a selection (e.g. "choose a card ..."): that is the next decision, not a failure.
+        if (SelectionPending())
+            return DetectDecisionPoint();
+
+        // "Hand unchanged" alone is not failure: some cards return to hand after being played
+        // (Particle Wall: GetResultLocationForCardPlay Discard -> Hand). Use the game's own combat history.
         var handAfter = pcs.Hand.Cards;
-        if (handAfter.Count == handCountBefore && cardIndex < handAfter.Count && handAfter[cardIndex] == card)
+        var unchanged = handAfter.Count == handCountBefore && cardIndex < handAfter.Count && handAfter[cardIndex] == card;
+        if (unchanged && CardPlaysStartedCount() <= playsStartedBefore)
         {
             return Error($"Card could not be played (still in hand after action): {card.GetType().Name} [{card.Id}]");
         }
+        if (unchanged)
+            Log($"Card {card.GetType().Name} was played and is back in hand at the same index");
 
         return DetectDecisionPoint();
     }
@@ -1029,6 +1041,12 @@ public class RunSimulator
     {
         var p = (_runState != null && _runState.Players.Count > 0) ? _runState.Players[0] : null;
         return p?.PlayerCombatState?.Phase == MegaCrit.Sts2.Core.Combat.PlayerTurnPhase.Play;
+    }
+
+    private static int CardPlaysStartedCount()
+    {
+        try { return CombatManager.Instance.History.CardPlaysStarted.Count(); }
+        catch { return -1; }
     }
 
     private bool SelectionPending() =>
@@ -1210,6 +1228,7 @@ public class RunSimulator
                         if (_turnStarted.IsSet || _combatEnded.IsSet) break;
                         if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
                         if (IsPlayPhase()) break;
+                        if (SelectionPending()) break;
                         Thread.Sleep(10);
                     }
                     YieldPatches.SuppressYield = false;
@@ -1223,15 +1242,23 @@ public class RunSimulator
                             Thread.Sleep(10);
                             if (IsPlayPhase() || !CombatManager.Instance.IsInProgress || player.Creature.IsDead)
                                 break;
+                            if (SelectionPending()) break;
                         }
                     }
 
+                    if (SelectionPending() && CombatManager.Instance.IsInProgress && !player.Creature.IsDead)
+                    {
+                        Log("end_turn: selection pending during nuclear fallback, surfacing it to the caller");
+                        return DetectDecisionPoint();
+                    }
                     if (IsPlayPhase())
                         Log("Nuclear fallback SUCCEEDED — play phase resumed");
                     else
                     {
                         Log("Nuclear fallback FAILED — forcing game_over to escape deadlock");
-                        return GameOverState(false);
+                        var forced = GameOverState(false);
+                        forced["stall_forced"] = true;   // not a real defeat: callers should discard, not learn from it
+                        return forced;
                     }
                 }
                 catch (Exception ex)
@@ -1397,6 +1424,7 @@ public class RunSimulator
         var entry = entries[idx];
         if (!entry.IsStocked) return Error("Potion already purchased");
         if (player.Gold < entry.Cost) return Error("Not enough gold");
+        if (!player.HasOpenPotionSlots) return Error("Potion belt is full");
 
         try
         {
@@ -2591,6 +2619,18 @@ public class RunSimulator
             return _runState?.CurrentRoom is MapRoom ? MapSelectState() : DetectDecisionPoint();
         }
 
+        // Events whose resolution needs Godot UI: CrystalSphere opens an interactive minigame screen
+        // (NCrystalSphereScreen.ShowScreen + await completion -> NRE or wait forever); Amalgamator removes the
+        // cards and then dereferences NGame.Instance before giving the combined card (deck loses cards).
+        // An agent cannot play them headless, so skip to the map on entry. (Ported from Zaaacqwq 422cad8.)
+        if (HeadlessUnsupportedEvents.Contains(localEvent.GetType().Name))
+        {
+            Log($"Event {localEvent.GetType().Name} needs Godot UI; auto-skipping in headless");
+            try { RunManager.Instance.EnterRoom(new MapRoom()).GetAwaiter().GetResult(); _syncCtx.Pump(); }
+            catch (Exception ex) { Log($"Skip event: {ex.Message}"); }
+            return MapSelectState();
+        }
+
         var currentOptions = localEvent.CurrentOptions;
         if (currentOptions == null || currentOptions.Count == 0)
         {
@@ -2833,6 +2873,7 @@ public class RunSimulator
             ["description"] = _loc.Bilingual("potions", (e.Model?.Id.Entry ?? "?") + ".description"),
             ["cost"] = e.Cost,
             ["is_stocked"] = e.IsStocked,
+            ["can_buy"] = e.IsStocked && player.Gold >= e.Cost && player.HasOpenPotionSlots,
         }).ToList();
 
         var removal = merchantRoom.GetLocalInventory().CardRemovalEntry;
@@ -3497,6 +3538,9 @@ public class RunSimulator
             YieldPatches.ChooseACardForced = false;
             if (forced && minSelect < 1) minSelect = 1;
             var optList = options.ToList();
+            // The game can ask for more cards than exist (manual-confirm prompts with fewer options than
+            // minSelect). Clamp so select_cards with every option is accepted instead of wedging forever.
+            if (minSelect > optList.Count) minSelect = optList.Count;
             if (optList.Count == 0)
                 return Task.FromResult<IEnumerable<CardModel>>(Array.Empty<CardModel>());
 
