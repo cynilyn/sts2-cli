@@ -420,17 +420,18 @@ public class RunSimulator
 
             if (args.TryGetValue("relics", out var relicsEl))
             {
-                var list = GetBackingList<RelicModel>(player, "_relics");
-                if (list != null)
+                // Go through Remove/AddRelicInternal so relics get an Owner and are registered with the run.
+                // Writing the backing list directly left ownerless relics and the next EnterRoom threw a
+                // NullReferenceException in RunState.Contains. (Same fix as Zaaacqwq/sts2-cli 91c91a8.)
+                foreach (var existing in player.Relics.ToList())
+                    player.RemoveRelicInternal(existing, silent: true);
+                foreach (var rEl in relicsEl.EnumerateArray())
                 {
-                    list.Clear();
-                    foreach (var rEl in relicsEl.EnumerateArray())
-                    {
-                        var id = rEl.GetString();
-                        if (id == null) continue;
-                        var model = ModelDb.GetById<RelicModel>(new ModelId("RELIC", id));
-                        if (model != null) list.Add(model.ToMutable());
-                    }
+                    var id = rEl.GetString();
+                    if (id == null) continue;
+                    var model = ModelDb.GetById<RelicModel>(new ModelId("RELIC", id));
+                    if (model == null) return Error($"Unknown relic: {id}");
+                    player.AddRelicInternal(model.ToMutable(), silent: true);
                 }
             }
             if (args.TryGetValue("deck", out var deckEl))
