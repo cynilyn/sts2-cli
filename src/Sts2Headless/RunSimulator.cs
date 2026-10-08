@@ -1363,7 +1363,40 @@ public class RunSimulator
             }
         }
 
+        WaitForTurnStartToSettle(player);
         return DetectDecisionPoint();
+    }
+
+    /// <summary>
+    /// The play phase can resume while start-of-turn effects are still adding cards to the hand
+    /// (draw, generated cards). Serializing then raced with those changes ("Collection was modified"
+    /// in CombatPlayState after end_turn, and a half-drawn hand). Wait until the hand size is stable and
+    /// the executor is idle (bounded), then serialize.
+    /// </summary>
+    private void WaitForTurnStartToSettle(Player player, int maxMs = 300)
+    {
+        try
+        {
+            var pcs = player.PlayerCombatState;
+            if (pcs == null || !CombatManager.Instance.IsInProgress || !IsPlayPhase()) return;
+            WaitForActionExecutor();
+            int first = pcs.Hand.Cards.Count, last = -1, stable = 0;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < maxMs)
+            {
+                _syncCtx.Pump();
+                if (SelectionPending()) return;
+                int n = pcs.Hand.Cards.Count;
+                bool busy = RunManager.Instance.ActionExecutor.IsRunning;
+                if (n == last && !busy) { if (++stable >= 3) break; }
+                else stable = 0;
+                last = n;
+                Thread.Sleep(1);
+            }
+            if (pcs.Hand.Cards.Count != first)
+                Log($"end_turn: hand still changing after play phase resumed ({first} -> {pcs.Hand.Cards.Count})");
+        }
+        catch (Exception ex) { Log($"WaitForTurnStartToSettle: {ex.Message}"); }
     }
 
     private Dictionary<string, object?> DoSelectCardReward(Player player, Dictionary<string, object?>? args)
@@ -2286,7 +2319,7 @@ public class RunSimulator
         var aliveEnemiesForTargeting = combatState?.Enemies?
             .Where(e => e != null && e.IsAlive).ToList() ?? new();
 
-        var hand = pcs?.Hand?.Cards?.Select((c, i) =>
+        var hand = pcs?.Hand?.Cards?.ToList().Select((c, i) =>
         {
             // Export the *currently resolved* stat values, not the card base: refresh the
             // DynamicVar previews (mirrors NCard.UpdateVisuals) so damage reflects Strength/Weak,
