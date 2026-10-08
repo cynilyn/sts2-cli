@@ -215,6 +215,56 @@ public class RunSimulator
     private readonly ManualResetEventSlim _turnStarted = new(false);
     private readonly ManualResetEventSlim _combatEnded = new(false);
     private static readonly LocLookup _loc = new();
+    // A few game APIs (shop purchase/removal, rest site, event options, the EndTurn nuclear fallback) run on
+    // the thread pool because they can enter the game's synchronous ICardSelector contract. Previously they were
+    // abandoned after a 2s Wait, so a still-running task could mutate game state while the next command ran
+    // (cross-thread "Collection was modified", nondeterminism). Track at most one and join it before the next
+    // command touches game state. Pattern ported from Zaaacqwq/sts2-cli (TrackExternalTask/ResumeExternalTask).
+    private Task? _pendingExternalTask;
+
+    private Task TrackExternalTask(Func<Task> start)
+    {
+        ResumeExternalTask();
+        if (_pendingExternalTask is { IsCompleted: false })
+            throw new InvalidOperationException("a previous background game operation is still running");
+        var task = Task.Run(start);
+        _pendingExternalTask = task;
+        return task;
+    }
+
+    private Task TrackExternalTask(Action start) => TrackExternalTask(() => { start(); return Task.CompletedTask; });
+
+    /// <summary>Pump the sync context until the task completes or the deadline passes (no blocking Wait).</summary>
+    private bool DrainUntilComplete(Task task, int maxMs = 2000)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (!task.IsCompleted && sw.ElapsedMilliseconds < maxMs)
+        {
+            _syncCtx.Pump();
+            if (SelectionPending()) return false;   // the caller must answer before the task can finish
+            Thread.Sleep(1);
+        }
+        _syncCtx.Pump();
+        return task.IsCompleted;
+    }
+
+    /// <summary>Join the tracked background operation before the next command mutates game state.</summary>
+    private void ResumeExternalTask(int maxMs = 5000)
+    {
+        var task = _pendingExternalTask;
+        if (task == null) return;
+        if (SelectionPending()) return;            // still waiting for the caller's answer
+        if (!DrainUntilComplete(task, maxMs))
+        {
+            if (!SelectionPending())
+                Log($"Background game operation still running after {maxMs}ms");
+            return;
+        }
+        _pendingExternalTask = null;
+        if (task.IsFaulted)
+            Log($"Background game operation failed: {task.Exception?.GetBaseException().Message}");
+    }
+
     private static readonly HashSet<string> HeadlessUnsupportedEvents =
         new(StringComparer.Ordinal) { "Amalgamator", "CrystalSphere" };
 
@@ -1215,10 +1265,9 @@ public class RunSimulator
 
                     // Run EndTurn on ThreadPool with SuppressYield permanently on
                     YieldPatches.SuppressYield = true;
-                    var endTurnTask = Task.Run(() =>
-                    {
-                        PlayerCmd.EndTurn(player, canBackOut: false);
-                    });
+                    // Unlike the fork (which inlines it), keep this on the thread pool so a wedged EndTurn cannot
+                    // block the engine forever; track it so it is joined before the next command.
+                    var endTurnTask = TrackExternalTask(() => PlayerCmd.EndTurn(player, canBackOut: false));
 
                     // Aggressively pump sync context while waiting (up to 5 seconds)
                     for (int i = 0; i < 500; i++)
@@ -1387,7 +1436,7 @@ public class RunSimulator
             // pending selection appears so the caller can resolve it; the background task
             // continues once the selector's TCS is fed by select_cards.
             var inv = merchantRoom.GetLocalInventory();
-            var task = Task.Run(() => entry.OnTryPurchaseWrapper(inv));
+            var task = TrackExternalTask(() => entry.OnTryPurchaseWrapper(inv));
             for (int i = 0; i < 100; i++)
             {
                 _syncCtx.Pump();
@@ -1401,7 +1450,7 @@ public class RunSimulator
                 Log($"Buy relic {entry.Model.GetType().Name}: yielded for pending selection");
                 return DetectDecisionPoint();
             }
-            if (!task.IsCompleted) task.Wait(2000);
+            if (!task.IsCompleted) DrainUntilComplete(task);
             _syncCtx.Pump();
             Log($"Bought relic: {entry.Model.GetType().Name} for {entry.Cost}g");
         }
@@ -1453,7 +1502,7 @@ public class RunSimulator
         try
         {
             // Run on background thread so card selection can pause (same pattern as event options)
-            var task = Task.Run(() => removal.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory()));
+            var task = TrackExternalTask(() => removal.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory()));
             for (int i = 0; i < 100; i++)
             {
                 _syncCtx.Pump();
@@ -1466,7 +1515,7 @@ public class RunSimulator
                 WaitForActionExecutor();
                 return DetectDecisionPoint();
             }
-            if (!task.IsCompleted) task.Wait(2000);
+            if (!task.IsCompleted) DrainUntilComplete(task);
             _syncCtx.Pump();
             Log($"Removed card for {removal.Cost}g");
         }
@@ -1703,7 +1752,7 @@ public class RunSimulator
             try
             {
                 // Run on background thread so Smith card selection can pause
-                var task = Task.Run(() => RunManager.Instance.RestSiteSynchronizer.ChooseLocalOption(optionIndex));
+                var task = TrackExternalTask(() => RunManager.Instance.RestSiteSynchronizer.ChooseLocalOption(optionIndex));
                 for (int i = 0; i < 100; i++)
                 {
                     _syncCtx.Pump();
@@ -1716,7 +1765,7 @@ public class RunSimulator
                     WaitForActionExecutor();
                     return DetectDecisionPoint();
                 }
-                if (!task.IsCompleted) task.Wait(2000);
+                if (!task.IsCompleted) DrainUntilComplete(task);
                 _syncCtx.Pump();
             }
             catch (Exception ex)
@@ -1756,7 +1805,7 @@ public class RunSimulator
                         _eventOptionChosen = true;
                         _lastEventOptionCount = options.Count;
                         // Run on thread pool so GetSelectedCards/GetSelectedCardReward can block
-                        var task = Task.Run(() => options[optionIndex].Chosen());
+                        var task = TrackExternalTask(() => options[optionIndex].Chosen());
                         for (int i = 0; i < 100; i++)
                         {
                             _syncCtx.Pump();
@@ -1770,7 +1819,7 @@ public class RunSimulator
                             WaitForActionExecutor();
                             return DetectDecisionPoint();
                         }
-                        if (!task.IsCompleted) task.Wait(2000);
+                        if (!task.IsCompleted) DrainUntilComplete(task);
                         _syncCtx.Pump();
                     }
                     catch (Exception ex) { Log($"Event choose: {ex.Message}"); }
@@ -3009,6 +3058,7 @@ public class RunSimulator
 
             // Pump the synchronization context to execute any pending continuations
             _syncCtx.Pump();
+            ResumeExternalTask();
 
             // Executor may stay "running" while the game awaits headless card selection / reward (e.g. Attack Potion).
             // Spinning here would time out and downstream code could mis-handle an in-flight potion use (BUG-026).
