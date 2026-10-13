@@ -46,3 +46,19 @@ def test_load_pre_neow_save_preserves_neow_choice(tmp_path):
         assert state["decision"] == "event_choice"
     finally:
         game.close()
+
+
+def test_load_save_twice_in_one_process(tmp_path):
+    save_path = tmp_path / "twice.save"
+
+    game = Game()
+    try:
+        state = game.skip_neow(game.start(seed="sl3"))
+        assert state["decision"] == "map_select"
+        assert game.send({"cmd": "write_continue_save", "path": str(save_path)})["success"] is True
+        first = game.send({"cmd": "load_save", "path": str(save_path)})
+        second = game.send({"cmd": "load_save", "path": str(save_path)})
+        assert first["decision"] == "map_select"
+        assert second["decision"] == "map_select", second
+    finally:
+        game.close()

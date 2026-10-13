@@ -96,3 +96,31 @@ class TestShopRemove:
             # Should return to shop with deck_size - 1
             if state.get("decision") == "shop":
                 assert state["player"]["deck_size"] == deck_before - 1
+
+
+class TestSozuPotions:
+    """Sozu: no potions can be obtained. The shop must say so instead of a silent no-op."""
+
+    def _sozu_shop(self, game, seed):
+        state = game.start(seed=seed)
+        game.skip_neow(state)
+        game.set_player(relics=["SOZU"], gold=999)
+        return game.enter_room("shop")
+
+    def test_potions_not_buyable_with_sozu(self, game):
+        state = self._sozu_shop(game, "sozu1")
+        assert state["decision"] == "shop"
+        assert state["potions"] and all(not p["can_buy"] for p in state["potions"])
+
+    def test_buy_potion_returns_error(self, game):
+        self._sozu_shop(game, "sozu2")
+        result = game.act("buy_potion", potion_index=0)
+        assert result.get("type") == "error"
+        assert "Sozu" in result["message"]
+
+    def test_potions_buyable_without_sozu(self, game):
+        state = game.start(seed="sozu3")
+        game.skip_neow(state)
+        game.set_player(gold=999)
+        state = game.enter_room("shop")
+        assert any(p["can_buy"] for p in state["potions"])

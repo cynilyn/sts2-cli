@@ -266,7 +266,7 @@ public class RunSimulator
         }
         _pendingExternalTask = null;
         if (task.IsFaulted)
-            Log($"Background game operation failed: {task.Exception?.GetBaseException().Message}");
+            Log($"Background game operation failed: {task.Exception?.GetBaseException()}");
     }
 
     private static readonly HashSet<string> HeadlessUnsupportedEvents =
@@ -610,6 +610,11 @@ public class RunSimulator
             var readResult = SaveManager.FromJson<SerializableRun>(saveJson);
             if (!readResult.Success || readResult.SaveData == null)
                 return Error($"Failed to parse save file: {readResult.Status} {readResult.ErrorMessage}");
+
+            // Like start_run, loading replaces the current run (a second load_save used to fail with
+            // "State is already set").
+            if (_runState != null || RunManager.Instance.IsInProgress)
+                CleanUp();
 
             var save = readResult.SaveData;
             Log($"Save loaded: seed={save.SerializableRng?.Seed}, act={save.CurrentActIndex}, ascension={save.Ascension}");
@@ -1566,6 +1571,12 @@ public class RunSimulator
         return DetectDecisionPoint();
     }
 
+    private bool CanProcurePotion(Player player, PotionModel? potion)
+    {
+        if (potion == null || _runState == null) return false;
+        return MegaCrit.Sts2.Core.Hooks.Hook.ShouldProcurePotion(_runState, player.Creature?.CombatState, potion, player);
+    }
+
     private Dictionary<string, object?> DoBuyPotion(Player player, Dictionary<string, object?>? args)
     {
         if (_runState?.CurrentRoom is not MerchantRoom merchantRoom)
@@ -1581,6 +1592,9 @@ public class RunSimulator
         if (!entry.IsStocked) return Error("Potion already purchased");
         if (player.Gold < entry.Cost) return Error("Not enough gold");
         if (!player.HasOpenPotionSlots) return Error("Potion belt is full");
+        // PotionCmd.TryToProcure refuses before any gold is spent (Sozu: ShouldProcurePotion=false); the
+        // purchase then fails silently, so report it instead of returning an unchanged state.
+        if (!CanProcurePotion(player, entry.Model)) return Error("Potions cannot be obtained (a relic such as Sozu forbids it)");
         var potionName = entry.Model?.GetType().Name ?? "?";
         var potionCost = entry.Cost;
 
@@ -3063,7 +3077,7 @@ public class RunSimulator
             ["description"] = _loc.Bilingual("potions", (e.Model?.Id.Entry ?? "?") + ".description"),
             ["cost"] = e.Cost,
             ["is_stocked"] = e.IsStocked,
-            ["can_buy"] = e.IsStocked && player.Gold >= e.Cost && player.HasOpenPotionSlots,
+            ["can_buy"] = e.IsStocked && player.Gold >= e.Cost && player.HasOpenPotionSlots && CanProcurePotion(player, e.Model),
         }).ToList();
 
         var removal = merchantRoom.GetLocalInventory().CardRemovalEntry;
@@ -3446,6 +3460,7 @@ public class RunSimulator
         PatchChooseACardScreen();
         PatchSelectionPurpose();
         PatchEventScreenShake();
+        PatchTrialEvent();
         PatchMonsterDeathHooks();
 
         // Initialize localization system (needed for events, cards, etc.)
@@ -3681,6 +3696,30 @@ public class RunSimulator
     }
 
     /// <summary>
+    /// Trial.Accept() (the first-page "Accept" and the Reject page's "Accept") opens with
+    /// NEventRoom.Instance.Layout.RemoveNodesOnPortrait() / SetPortrait / AddVfxAnchoredToPortrait, none of
+    /// which exist in headless, so it threw an NRE before SetEventState and the page never advanced (the
+    /// option "worked" with an unchanged state). Replace it with the same logic minus the portrait/VFX work:
+    /// pick the verdict page with the event's own Rng and set its two options.
+    /// </summary>
+    private static void PatchTrialEvent()
+    {
+        try
+        {
+            var trial = typeof(CombatManager).Assembly.GetType("MegaCrit.Sts2.Core.Models.Events.Trial");
+            var accept = trial?.GetMethod("Accept", BindingFlags.Instance | BindingFlags.NonPublic);
+            if (accept == null) { Console.Error.WriteLine("[WARN] Trial.Accept not found to patch"); return; }
+            new Harmony("sts2headless.trial").Patch(accept,
+                prefix: new HarmonyMethod(typeof(YieldPatches).GetMethod(nameof(YieldPatches.TrialAcceptPrefix))));
+            Console.Error.WriteLine("[INFO] Patched Trial.Accept (no portrait/VFX in headless)");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WARN] Failed to patch Trial event: {ex.Message}");
+        }
+    }
+
+    /// <summary>
     /// Amalgamator (combine 2 Strikes/Defends into Ultimate Strike/Defend) and PunchOff call
     /// NGame.Instance.ScreenShakeTrauma(...) without a null check. NGame does not exist headless, so the
     /// event threw right after removing the two cards and never added the combined card (deck lost cards).
@@ -3695,7 +3734,8 @@ public class RunSimulator
             var harmony = new Harmony("sts2headless.screenshake");
             var transpiler = new HarmonyMethod(typeof(YieldPatches).GetMethod(nameof(YieldPatches.ScreenShakeTranspiler)));
             int patched = 0;
-            foreach (var name in new[] { "MegaCrit.Sts2.Core.Models.Events.Amalgamator", "MegaCrit.Sts2.Core.Models.Events.PunchOff" })
+            foreach (var name in new[] { "MegaCrit.Sts2.Core.Models.Events.Amalgamator", "MegaCrit.Sts2.Core.Models.Events.PunchOff",
+                "MegaCrit.Sts2.Core.Models.Events.DenseVegetation", "MegaCrit.Sts2.Core.Models.Events.JungleMazeAdventure" })
             {
                 var type = asm.GetType(name);
                 if (type == null) { Console.Error.WriteLine($"[WARN] {name} not found for screen-shake patch"); continue; }
@@ -3986,25 +4026,34 @@ public class RunSimulator
 
         public static void ChooseACardPostfix() => ChooseACardForced = false;
 
-        /// <summary>Replace `callvirt NGame.ScreenShakeTrauma(ShakeStrength)` with a static null-safe no-op
-        /// taking the same stack (instance, enum as int).</summary>
+        /// <summary>Replace cosmetic UI calls whose singleton is null in headless (NGame.ScreenShakeTrauma /
+        /// ScreenRumble, NDebugAudioManager.Play / Stop) with "pop the arguments, push 0 if it returned an int".
+        /// A callvirt on a null instance throws before Harmony could intercept the method itself.</summary>
         public static IEnumerable<HarmonyLib.CodeInstruction> ScreenShakeTranspiler(IEnumerable<HarmonyLib.CodeInstruction> instructions)
         {
-            var safe = typeof(YieldPatches).GetMethod(nameof(SafeScreenShake));
+            var op = System.Reflection.Emit.OpCodes.Pop;
             foreach (var ci in instructions)
             {
                 if ((ci.opcode == System.Reflection.Emit.OpCodes.Callvirt || ci.opcode == System.Reflection.Emit.OpCodes.Call)
-                    && ci.operand is System.Reflection.MethodInfo mi && mi.Name == "ScreenShakeTrauma"
-                    && mi.DeclaringType?.Name == "NGame" && mi.GetParameters().Length == 1)
+                    && ci.operand is System.Reflection.MethodInfo mi && !mi.IsStatic && IsCosmeticUiCall(mi))
                 {
-                    yield return new HarmonyLib.CodeInstruction(System.Reflection.Emit.OpCodes.Call, safe) { labels = ci.labels, blocks = ci.blocks };
+                    int pops = mi.GetParameters().Length + 1;   // arguments + the (null) instance
+                    var first = new HarmonyLib.CodeInstruction(op) { labels = ci.labels, blocks = ci.blocks };
+                    yield return first;
+                    for (int i = 1; i < pops; i++) yield return new HarmonyLib.CodeInstruction(op);
+                    if (mi.ReturnType == typeof(int)) yield return new HarmonyLib.CodeInstruction(System.Reflection.Emit.OpCodes.Ldc_I4_0);
+                    else if (mi.ReturnType != typeof(void)) throw new NotSupportedException($"cosmetic call {mi.DeclaringType?.Name}.{mi.Name} returns {mi.ReturnType.Name}");
                 }
                 else yield return ci;
             }
         }
 
-        /// <summary>Headless has no screen to shake; also tolerates the null NGame.Instance.</summary>
-        public static void SafeScreenShake(object? game, int strength) { }
+        private static bool IsCosmeticUiCall(System.Reflection.MethodInfo mi) => mi.DeclaringType?.Name switch
+        {
+            "NGame" => mi.Name == "ScreenShakeTrauma" || mi.Name == "ScreenRumble",
+            "NDebugAudioManager" => mi.Name == "Play" || mi.Name == "Stop",
+            _ => false,
+        };
 
         // Only suppress Task.Yield() when this flag is set (during end_turn processing)
         public static volatile bool SuppressYield;
@@ -4045,6 +4094,36 @@ public class RunSimulator
             if (__exception is not NullReferenceException) return __exception;
             Console.Error.WriteLine($"[SIM] swallowed NRE in {__originalMethod.DeclaringType?.Name}.{__originalMethod.Name}");
             return null;
+        }
+
+        private static readonly string[][] TrialVerdicts =
+        {
+            new[] { "MERCHANT", "MerchantGuilty", "MerchantInnocent" },
+            new[] { "NOBLE", "NobleGuilty", "NobleInnocent" },
+            new[] { "NONDESCRIPT", "NondescriptGuilty", "NondescriptInnocent" },
+        };
+
+        /// <summary>Headless replacement for Trial.Accept (see PatchTrialEvent).</summary>
+        public static bool TrialAcceptPrefix(EventModel __instance, ref Task __result)
+        {
+            const BindingFlags any = BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
+            var type = __instance.GetType();
+            var v = TrialVerdicts[__instance.Rng.NextInt(3)];
+            EventOption Opt(string method, string key) => new EventOption(__instance,
+                (Func<Task>)Delegate.CreateDelegate(typeof(Func<Task>), __instance, type.GetMethod(method, any)!),
+                key, new List<MegaCrit.Sts2.Core.HoverTips.IHoverTip>());
+            var options = new[]
+            {
+                Opt(v[1], $"TRIAL.pages.{v[0]}.options.GUILTY"),
+                Opt(v[2], $"TRIAL.pages.{v[0]}.options.INNOCENT"),
+            };
+            var l10n = typeof(EventModel).GetMethod("L10NLookup", any)!;
+            var locString = (LocString)l10n.Invoke(__instance, new object[] { "TRIAL.trialFormat" })!;
+            var story = (LocString)l10n.Invoke(__instance, new object[] { $"TRIAL.pages.{v[0]}.description" })!;
+            locString.Add(new MegaCrit.Sts2.Core.Localization.DynamicVars.StringVar("TrialStory", story.GetRawText()));
+            typeof(EventModel).GetMethod("SetEventState", any)!.Invoke(__instance, new object[] { locString, options });
+            __result = Task.CompletedTask;
+            return false;
         }
 
         /// <summary>Harmony finalizer (Task-returning hooks): as above, and hand back a completed Task.</summary>
