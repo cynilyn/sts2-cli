@@ -275,6 +275,13 @@ public class RunSimulator
     private bool _eventOptionChosen;
     private int _lastEventOptionCount;
 
+    // Run state captured on the map just before the last select_map_node. A checkpoint written from inside
+    // the room it led to is taken from this, so odds / RNG / act pools / event history are the values the
+    // room roll started from (the real game saves before the roll and re-rolls the room on continue).
+    private SerializableRun? _preRoomSave;
+    private int _preRoomVisitedCount;
+    private int _preRoomActIndex;
+
     // Pending rewards for card selection (populated after combat, before proceeding)
     private List<Reward>? _pendingRewards;
     private CardReward? _pendingCardReward;
@@ -546,9 +553,7 @@ public class RunSimulator
                     return Error($"Unknown room type: {roomType}");
             }
 
-            RunManager.Instance.EnterRoom(room).GetAwaiter().GetResult();
-            _syncCtx.Pump();
-            WaitForActionExecutor();
+            EnterRoomYielding(() => RunManager.Instance.EnterRoom(room), $"EnterRoom {roomType}");
             return DetectDecisionPoint();
         }
         catch (Exception ex) { return ErrorWithTrace("EnterRoom failed", ex); }
@@ -619,6 +624,8 @@ public class RunSimulator
             var save = readResult.SaveData;
             Log($"Save loaded: seed={save.SerializableRng?.Seed}, act={save.CurrentActIndex}, ascension={save.Ascension}");
 
+            NormalizeLegacyPostRollSave(save);
+
             _runState = RunState.FromSerializable(save);
             if (_runState == null)
                 return Error("Failed to create RunState from save");
@@ -654,8 +661,18 @@ public class RunSimulator
                 // should not send the player back through the Ancient start node.
                 if (_runState.CurrentActIndex == 0 && savedVisitedCoords.Count > 0)
                     _runState.ExtraFields.StartedWithNeow = false;
+                // EnterAct -> SetActInternal calls Odds.UnknownMapPoint.ResetToBase(), which is right when an act
+                // begins but wrong for a mid-act continue: the real game resumes through LoadIntoLatestMapCoord
+                // and keeps the saved odds. Without this the next '?' roll uses base odds and can land on a
+                // different room than the original run (shop vs event).
+                var unknownOdds = _runState.Odds.UnknownMapPoint;
+                var (savedMonsterOdds, savedEliteOdds, savedTreasureOdds, savedShopOdds) =
+                    (unknownOdds.MonsterOdds, unknownOdds.EliteOdds, unknownOdds.TreasureOdds, unknownOdds.ShopOdds);
                 RunManager.Instance.EnterAct(_runState.CurrentActIndex, doTransition: false).GetAwaiter().GetResult();
                 _syncCtx.Pump();
+                unknownOdds = _runState.Odds.UnknownMapPoint;
+                (unknownOdds.MonsterOdds, unknownOdds.EliteOdds, unknownOdds.TreasureOdds, unknownOdds.ShopOdds) =
+                    (savedMonsterOdds, savedEliteOdds, savedTreasureOdds, savedShopOdds);
                 Log($"Entered Act {_runState.CurrentActIndex}");
 
                 if (shouldResumeInitialNeow && _runState.Map?.StartingMapPoint != null)
@@ -689,6 +706,34 @@ public class RunSimulator
         {
             return ErrorWithTrace("LoadSave failed", ex);
         }
+    }
+
+    /// <summary>
+    /// Checkpoints written by older builds from inside a room dropped the room's coord from
+    /// visited_map_coords but left its map_point_history entry (and the post-roll odds / RNG). Drop that
+    /// stale entry so the game does not record the node twice and, for a '?' node, remember the room type
+    /// that was originally rolled: the RNG state needed to reproduce the roll is gone, but the recorded
+    /// outcome is not.
+    /// </summary>
+    private void NormalizeLegacyPostRollSave(SerializableRun save)
+    {
+        YieldPatches.ForcedUnknownRoom = null;
+        try
+        {
+            var history = save.MapPointHistory;
+            if (save.CurrentActIndex < 0 || save.CurrentActIndex >= history.Count) return;
+            var actHistory = history[save.CurrentActIndex];
+            if (actHistory.Count != save.VisitedMapCoords.Count + 1) return;
+            var stale = actHistory[^1];
+            actHistory.RemoveAt(actHistory.Count - 1);
+            if (stale.MapPointType == MapPointType.Unknown && stale.Rooms.Count > 0)
+            {
+                YieldPatches.ForcedUnknownRoom = stale.Rooms[0].RoomType;
+                YieldPatches.ForcedUnknownAtVisited = save.VisitedMapCoords.Count + 1;
+                Log($"Legacy post-roll save: next '?' node resolves to {stale.Rooms[0].RoomType} as originally rolled");
+            }
+        }
+        catch (Exception ex) { Log($"Legacy save normalization skipped: {ex.Message}"); }
     }
 
     /// <summary>
@@ -941,10 +986,21 @@ public class RunSimulator
             }
             else
             {
-                Log($"Saving pre-room checkpoint from {currentRoom.GetType().Name} (outputPath={outputPath})...");
-                serializableRun = RunManager.Instance.ToSave(new MapRoom());
-                if (!TryRollbackSerializedSaveToPreRoom(serializableRun, out var rollbackError))
-                    return Error($"Cannot save checkpoint: {rollbackError}");
+                if (_preRoomSave != null && _preRoomActIndex == _runState.CurrentActIndex
+                    && _preRoomVisitedCount + 1 == _runState.VisitedMapCoords.Count)
+                {
+                    Log($"Saving pre-room checkpoint from {currentRoom.GetType().Name} using the map-time snapshot (outputPath={outputPath})...");
+                    serializableRun = _preRoomSave;
+                }
+                else
+                {
+                    // No usable snapshot (room entered by enter_room, or a loaded mid-room save): trim the
+                    // visited coords only. Odds / RNG then already include this room's roll.
+                    Log($"Saving pre-room checkpoint from {currentRoom.GetType().Name} (outputPath={outputPath})...");
+                    serializableRun = RunManager.Instance.ToSave(new MapRoom());
+                    if (!TryRollbackSerializedSaveToPreRoom(serializableRun, out var rollbackError))
+                        return Error($"Cannot save checkpoint: {rollbackError}");
+                }
             }
 
             var saveJson = SaveManager.ToJson(serializableRun);
@@ -1027,6 +1083,45 @@ public class RunSimulator
 
     #region Actions
 
+    private void CapturePreRoomSave()
+    {
+        _preRoomSave = null;
+        try
+        {
+            if (_runState == null || _runState.CurrentRoom is not (MapRoom or null)) return;
+            _preRoomSave = RunManager.Instance.ToSave(_runState.CurrentRoom);
+            _preRoomVisitedCount = _runState.VisitedMapCoords.Count;
+            _preRoomActIndex = _runState.CurrentActIndex;
+        }
+        catch (Exception ex) { Log($"Pre-room snapshot failed: {ex.Message}"); }
+    }
+
+    /// <summary>
+    /// Room-entry hooks can open a selection before the room is even usable (Lord's Parasol buys the whole
+    /// shop on entry, and a bought card/relic can pop a card reward or card_select). The game blocks the
+    /// calling thread on that prompt, so run the entry on a background task and yield as soon as a
+    /// selection is pending; select_cards / the reward answer lets the task finish.
+    /// </summary>
+    private void EnterRoomYielding(Func<Task> enter, string what)
+    {
+        var task = TrackExternalTask(enter);
+        for (int i = 0; i < 1000; i++)
+        {
+            _syncCtx.Pump();
+            if (SelectionPending() || task.IsCompleted) break;
+            Thread.Sleep(5);
+        }
+        if (SelectionPending())
+        {
+            Log($"{what}: yielded for pending selection");
+            return;
+        }
+        if (!task.IsCompleted) DrainUntilComplete(task, 10000);
+        if (task.IsFaulted) throw task.Exception!.GetBaseException();
+        _syncCtx.Pump();
+        WaitForActionExecutor();
+    }
+
     private Dictionary<string, object?> DoMapSelect(Player player, Dictionary<string, object?>? args)
     {
         if (args == null || !args.ContainsKey("col") || !args.ContainsKey("row"))
@@ -1052,9 +1147,8 @@ public class RunSimulator
 
         // Call EnterMapCoord directly (same as what MoveToMapCoordAction does in TestMode)
         // This avoids the action executor which can swallow errors silently.
-        RunManager.Instance.EnterMapCoord(coord).GetAwaiter().GetResult();
-        _syncCtx.Pump();
-        WaitForActionExecutor();
+        CapturePreRoomSave();
+        EnterRoomYielding(() => RunManager.Instance.EnterMapCoord(coord), $"Map entry ({col},{row})");
 
         return DetectDecisionPoint();
     }
@@ -3461,6 +3555,7 @@ public class RunSimulator
         PatchSelectionPurpose();
         PatchEventScreenShake();
         PatchTrialEvent();
+        PatchUnknownRoomRoll();
         PatchMonsterDeathHooks();
 
         // Initialize localization system (needed for events, cards, etc.)
@@ -3692,6 +3787,23 @@ public class RunSimulator
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[WARN] Failed to patch selection purpose: {ex.Message}");
+        }
+    }
+
+    /// <summary>Lets a legacy post-roll checkpoint reuse the '?' outcome it recorded (see NormalizeLegacyPostRollSave).</summary>
+    private static void PatchUnknownRoomRoll()
+    {
+        try
+        {
+            var roll = typeof(CombatManager).Assembly.GetType("MegaCrit.Sts2.Core.Odds.UnknownMapPointOdds")?.GetMethod("Roll");
+            if (roll == null) { Console.Error.WriteLine("[WARN] UnknownMapPointOdds.Roll not found to patch"); return; }
+            new Harmony("sts2headless.unknownroll").Patch(roll,
+                prefix: new HarmonyMethod(typeof(YieldPatches).GetMethod(nameof(YieldPatches.UnknownRollPrefix))));
+            Console.Error.WriteLine("[INFO] Patched UnknownMapPointOdds.Roll (legacy checkpoint outcome)");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WARN] Failed to patch UnknownMapPointOdds.Roll: {ex.Message}");
         }
     }
 
@@ -4102,6 +4214,19 @@ public class RunSimulator
             new[] { "NOBLE", "NobleGuilty", "NobleInnocent" },
             new[] { "NONDESCRIPT", "NondescriptGuilty", "NondescriptInnocent" },
         };
+
+        public static RoomType? ForcedUnknownRoom;
+        public static int ForcedUnknownAtVisited;
+
+        public static bool UnknownRollPrefix(IRunState runState, ref RoomType __result)
+        {
+            var forced = ForcedUnknownRoom;
+            if (forced == null) return true;
+            ForcedUnknownRoom = null;
+            if ((runState as RunState)?.VisitedMapCoords.Count != ForcedUnknownAtVisited) return true;
+            __result = forced.Value;
+            return false;
+        }
 
         /// <summary>Headless replacement for Trial.Accept (see PatchTrialEvent).</summary>
         public static bool TrialAcceptPrefix(EventModel __instance, ref Task __result)
@@ -4608,6 +4733,8 @@ public class RunSimulator
             _pendingBundleTcs = null;
             _eventOptionChosen = false;
             _lastEventOptionCount = 0;
+            _preRoomSave = null;
+            YieldPatches.ForcedUnknownRoom = null;
 
             if (RunManager.Instance.IsInProgress)
                 RunManager.Instance.CleanUp(graceful: true);
