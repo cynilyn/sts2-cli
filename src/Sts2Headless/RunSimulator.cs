@@ -2672,6 +2672,8 @@ public class RunSimulator
                     ["intents"] = intents.Count > 0 ? intents : null,
                     ["intends_attack"] = e.Monster?.IntendsToAttack ?? false,
                     ["powers"] = ePowers?.Count > 0 ? ePowers : null,
+                    // Kaiser Crab: which side of the player this part is on (BackAttackLeft = it stands on the left).
+                    ["side"] = e.HasPower<BackAttackLeftPower>() ? "Left" : e.HasPower<BackAttackRightPower>() ? "Right" : null,
                 };
             }).ToList() ?? new();
 
@@ -2696,6 +2698,8 @@ public class RunSimulator
             ["enemies"] = enemies,
             ["player"] = PlayerSummary(player),
             ["player_powers"] = playerPowers?.Count > 0 ? playerPowers : null,
+            // Surrounded (Kaiser Crab): direction the player faces; null in other fights.
+            ["facing"] = player.Creature?.GetPower<SurroundedPower>()?.Facing.ToString(),
             ["draw_pile_count"] = pcs?.DrawPile?.Cards?.Count ?? 0,
             ["discard_pile_count"] = pcs?.DiscardPile?.Cards?.Count ?? 0,
             // Pile contents as sorted ids ("BASH+" = upgraded). Sorted so the draw ORDER stays hidden; the
