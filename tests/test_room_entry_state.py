@@ -195,3 +195,38 @@ def test_legacy_post_roll_checkpoint_keeps_the_recorded_unknown_outcome():
         assert state["decision"] == "shop", state
     finally:
         game.close()
+
+
+def _die_by_ending_turns(game, state, limit=8):
+    for _ in range(limit):
+        if state.get("decision") != "combat_play":
+            return state
+        state = game.act("end_turn")
+    raise AssertionError("player did not die")
+
+
+def test_death_after_enter_room_combat_is_game_over():
+    """Combat started by the room-entry task must still report death as game_over (not card_reward at HP 0)."""
+    game = Game()
+    try:
+        game.skip_neow(game.start(seed="die1"))
+        game.set_player(hp=1, max_hp=80)
+        state = game.send({"cmd": "enter_room", "type": "combat", "encounter": "NIBBITS_WEAK"})
+        state = _die_by_ending_turns(game, state)
+        assert state["decision"] == "game_over", state
+    finally:
+        game.close()
+
+
+def test_death_after_map_node_combat_is_game_over():
+    game = Game()
+    try:
+        state = game.skip_neow(game.start(seed="die2"))
+        game.set_player(hp=1, max_hp=80)
+        pick = state["choices"][0]
+        state = game.act("select_map_node", col=pick["col"], row=pick["row"])
+        assert state["decision"] == "combat_play", state
+        state = _die_by_ending_turns(game, state)
+        assert state["decision"] == "game_over", state
+    finally:
+        game.close()

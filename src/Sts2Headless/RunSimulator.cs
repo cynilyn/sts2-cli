@@ -1104,7 +1104,13 @@ public class RunSimulator
     /// </summary>
     private void EnterRoomYielding(Func<Task> enter, string what)
     {
-        var task = TrackExternalTask(enter);
+        // The entry may start a combat; its continuations must run through the simulator's sync context
+        // (pumped on this thread) exactly as they do when the entry runs inline.
+        var task = TrackExternalTask(() =>
+        {
+            SynchronizationContext.SetSynchronizationContext(_syncCtx);
+            return enter();
+        });
         for (int i = 0; i < 1000; i++)
         {
             _syncCtx.Pump();
