@@ -236,6 +236,13 @@ class Program
                 return sim.SetDrawOrder(cards);
             }
 
+            case "reseed_combat_rng":
+            {
+                if (!cmd.TryGetProperty("seed", out var rs))
+                    return new Dictionary<string, object?> { ["type"] = "error", ["message"] = "reseed_combat_rng requires 'seed'" };
+                return sim.ReseedCombatRng(rs.ValueKind == JsonValueKind.String ? rs.GetString() ?? "" : rs.GetRawText());
+            }
+
             case "write_continue_save":
             {
                 var outputPath = cmd.TryGetProperty("path", out var op) ? op.GetString() : null;

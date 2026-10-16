@@ -6,6 +6,8 @@ using MegaCrit.Sts2.Core.Events;
 using MegaCrit.Sts2.Core.Entities.Ascension;
 using MegaCrit.Sts2.Core.Entities.Cards;
 using MegaCrit.Sts2.Core.Entities.Creatures;
+using MegaCrit.Sts2.Core.Entities.Rngs;
+using MegaCrit.Sts2.Core.Random;
 using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.GameActions;
 using MegaCrit.Sts2.Core.Helpers;
@@ -575,8 +577,12 @@ public class RunSimulator
             var available = new List<CardModel>(drawList);
             foreach (var cardId in cardIds)
             {
+                // "BASH+" names the upgraded copy; a bare id matches either (first in pile order).
+                var wantUpgraded = cardId.EndsWith('+');
+                var wantId = wantUpgraded ? cardId[..^1] : cardId;
                 var match = available.FirstOrDefault(c =>
-                    c.Id.Entry.Equals(cardId, StringComparison.OrdinalIgnoreCase));
+                    c.Id.Entry.Equals(wantId, StringComparison.OrdinalIgnoreCase)
+                    && (!wantUpgraded || c.IsUpgraded));
                 if (match != null)
                 {
                     newOrder.Add(match);
@@ -597,6 +603,47 @@ public class RunSimulator
             };
         }
         catch (Exception ex) { return ErrorWithTrace("SetDrawOrder failed", ex); }
+    }
+
+    /// <summary>
+    /// Re-initialises the combat random streams from <paramref name="seed"/> so that everything drawn from
+    /// them from now on is unrelated to the original run's seed. Already-rolled information stays as is: the
+    /// intents on display (MonsterModel.NextMove) and the current hand / draw order are untouched. Map,
+    /// reward and shop streams are not touched.
+    /// </summary>
+    public Dictionary<string, object?> ReseedCombatRng(string seedText)
+    {
+        try
+        {
+            if (_runState == null) return Error("No run in progress");
+            var player = _runState.Players[0];
+            if (player.PlayerCombatState == null || !CombatManager.Instance.IsInProgress)
+                return Error("Not in combat");
+
+            var seed = ulong.TryParse(seedText, out var n) ? n : MegaCrit.Sts2.Core.Helpers.StringHelper.GetDeterministicHashCode(seedText);
+            var streams = new List<string>();
+            var runRng = ((RunState)_runState).Rng;
+            foreach (var type in new[]
+            {
+                RunRngType.Shuffle, RunRngType.CombatCardGeneration, RunRngType.CombatPotionGeneration,
+                RunRngType.CombatCardSelection, RunRngType.CombatEnergyCosts, RunRngType.CombatTargets,
+                RunRngType.MonsterAi, RunRngType.CombatOrbs,
+            })
+            {
+                var name = MegaCrit.Sts2.Core.Helpers.StringHelper.SnakeCase(type.ToString());
+                runRng.GetRng(type).LoadFromSerializable(new Rng(seed, name).ToSerializable());
+                streams.Add(name);
+            }
+            foreach (var e in player.Creature.CombatState?.Enemies ?? Array.Empty<Creature>())
+            {
+                if (e.Monster == null) continue;
+                e.Monster.Rng = new Rng(seed, $"monster_{e.CombatId}");
+                streams.Add($"monster_{e.CombatId}");
+            }
+            Log($"ReseedCombatRng: seed={seed}, {streams.Count} streams");
+            return new Dictionary<string, object?> { ["type"] = "ok", ["seed"] = seed.ToString(), ["streams"] = streams };
+        }
+        catch (Exception ex) { return ErrorWithTrace("ReseedCombatRng failed", ex); }
     }
 
     // ─── Game actions ───
