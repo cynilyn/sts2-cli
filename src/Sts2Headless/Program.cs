@@ -87,14 +87,20 @@ class Program
             return null;
         };
 
+        if (RunSimulator.OracleMode) OracleStartup(libDir);
+
         var sim = new RunSimulator();
         WriteLine(new Dictionary<string, object?> { ["type"] = "ready", ["version"] = "0.2.0" });
+        var oracleHang = RunSimulator.OracleMode && Environment.GetEnvironmentVariable("STS2_ORACLE_TEST_HANG") == "1";
+        var commandCount = 0;
 
         string? line;
         while ((line = Console.ReadLine()) != null)
         {
             line = line.Trim();
             if (string.IsNullOrEmpty(line)) continue;
+            // Interop preflight only: simulate a wedged oracle on the second command.
+            if (oracleHang && ++commandCount >= 2) Thread.Sleep(Timeout.Infinite);
 
             Dictionary<string, object?>? result;
             try
@@ -133,7 +139,16 @@ class Program
                     cmd.TryGetProperty("character", out var ch) ? ch.GetString() ?? "Ironclad" : "Ironclad",
                     cmd.TryGetProperty("ascension", out var asc) ? asc.GetInt32() : 0,
                     cmd.TryGetProperty("seed", out var s) ? s.GetString() : null,
-                    cmd.TryGetProperty("lang", out var lang) ? lang.GetString() ?? "en" : "en"
+                    cmd.TryGetProperty("lang", out var lang) ? lang.GetString() ?? "en" : "en",
+                    // Parity-oracle extras (spire-mentor harness); absent = previous behaviour.
+                    cmd.TryGetProperty("played_save", out var ps) && ps.ValueKind == JsonValueKind.True,
+                    cmd.TryGetProperty("act1", out var a1) && a1.ValueKind == JsonValueKind.String ? a1.GetString() : null
+                );
+
+            case "roll_acts":
+                return sim.RollActs(
+                    cmd.TryGetProperty("seed", out var rs) ? rs.GetString() : null,
+                    cmd.TryGetProperty("played_save", out var rps) && rps.ValueKind == JsonValueKind.True
                 );
 
             case "action":
@@ -227,6 +242,36 @@ class Program
             case "get_draw_pile":
                 return sim.GetDrawPile();
 
+            // Parity-oracle commands (spire-mentor sts2-pycli harness). See RunSimulator.Oracle.cs.
+            case "legal_actions":
+                return sim.LegalActions();
+
+            case "get_state":
+                return sim.GetState();
+
+            case "dump_rooms":
+                return sim.DumpRooms();
+
+            case "dump_maps":
+                return sim.DumpMaps();
+
+            case "dump_card_reward":
+                return sim.DumpCardReward(
+                    cmd.TryGetProperty("count", out var dcc) ? dcc.GetInt32() : 3,
+                    cmd.TryGetProperty("room_type", out var drt) ? (drt.GetString() ?? "Monster") : "Monster");
+
+            case "dump_relic_reward":
+                return sim.DumpRelicReward(cmd.TryGetProperty("count", out var drc) ? drc.GetInt32() : 1);
+
+            case "dump_shop":
+                return sim.DumpShop();
+
+            case "dump_content":
+                return sim.DumpContent();
+
+            case "dump_events":
+                return sim.DumpEvents();
+
             case "set_draw_order":
             {
                 var cards = new List<string>();
@@ -278,6 +323,80 @@ class Program
             default:
                 return new Dictionary<string, object?> { ["type"] = "error", ["message"] = $"Unknown command: {cmdType}" };
         }
+    }
+
+    /// <summary>
+    /// STS2_ORACLE=1 startup (parity-oracle launch manifest): UTF-8 stderr (the harness drains it as UTF-8),
+    /// optional stderr copy to STS2_ORACLE_STDERR_DIR/oracle_&lt;pid&gt;.log, optional self affinity
+    /// (STS2_ORACLE_AFFINITY, hex mask) + BelowNormal, and one "[ORACLE] {json}" stderr line with pid, lib
+    /// directory, DLL hashes and runtime. Nothing here touches stdout.
+    /// </summary>
+    static void OracleStartup(string libDir)
+    {
+        var utf8 = new System.Text.UTF8Encoding(false);
+        TextWriter err = new StreamWriter(Console.OpenStandardError(), utf8) { AutoFlush = true };
+        var dir = Environment.GetEnvironmentVariable("STS2_ORACLE_STDERR_DIR");
+        if (!string.IsNullOrEmpty(dir))
+        {
+            try
+            {
+                Directory.CreateDirectory(dir);
+                var file = new StreamWriter(Path.Combine(dir, $"oracle_{Environment.ProcessId}.log"), false, utf8) { AutoFlush = true };
+                err = new TeeWriter(err, file);
+            }
+            catch (Exception ex) { err.WriteLine($"[ORACLE] stderr copy failed: {ex.Message}"); }
+        }
+        Console.SetError(TextWriter.Synchronized(err));
+
+        var proc = System.Diagnostics.Process.GetCurrentProcess();
+        var aff = Environment.GetEnvironmentVariable("STS2_ORACLE_AFFINITY");
+        string? affErr = null;
+        if (!string.IsNullOrEmpty(aff))
+        {
+            try
+            {
+                proc.ProcessorAffinity = (IntPtr)Convert.ToInt64(aff.Replace("0x", ""), 16);
+                proc.PriorityClass = System.Diagnostics.ProcessPriorityClass.BelowNormal;
+            }
+            catch (Exception ex) { affErr = ex.Message; }
+        }
+        proc.Refresh();
+
+        static string? Sha(string p)
+        {
+            try { using var f = File.OpenRead(p); return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(f)); }
+            catch { return null; }
+        }
+        var baseDir = AppContext.BaseDirectory;
+        var manifest = new Dictionary<string, object?>
+        {
+            ["pid"] = Environment.ProcessId,
+            ["start"] = DateTimeOffset.Now.ToString("o"),
+            ["exe_dir"] = baseDir,
+            ["lib_dir"] = libDir,
+            ["sts2_dll_sha256"] = Sha(Path.Combine(libDir, "sts2.dll")),
+            ["headless_dll_sha256"] = Sha(Path.Combine(baseDir, "Sts2Headless.dll")),
+            ["godot_stub_sha256"] = Sha(Path.Combine(baseDir, "GodotSharp.dll")),
+            ["runtime"] = System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription,
+            ["affinity"] = $"0x{(long)proc.ProcessorAffinity:X}",
+            ["priority"] = proc.PriorityClass.ToString(),
+            ["affinity_error"] = affErr,
+            ["env"] = Environment.GetEnvironmentVariables().Cast<System.Collections.DictionaryEntry>()
+                .Where(e => ((string)e.Key).StartsWith("STS2_"))
+                .ToDictionary(e => (string)e.Key, e => (object?)e.Value),
+        };
+        Console.Error.WriteLine("[ORACLE] " + JsonSerializer.Serialize(manifest));
+    }
+
+    sealed class TeeWriter : TextWriter
+    {
+        private readonly TextWriter _a, _b;
+        public TeeWriter(TextWriter a, TextWriter b) { _a = a; _b = b; }
+        public override System.Text.Encoding Encoding => _a.Encoding;
+        public override void Write(char value) { _a.Write(value); _b.Write(value); }
+        public override void Write(string? value) { _a.Write(value); _b.Write(value); }
+        public override void WriteLine(string? value) { _a.WriteLine(value); _b.WriteLine(value); }
+        public override void Flush() { _a.Flush(); _b.Flush(); }
     }
 
     static void WriteLine(Dictionary<string, object?> data)

@@ -203,7 +203,7 @@ internal class LocLookup
 /// through map navigation, combat, events, rest sites, shops, and act transitions.
 /// Drives the engine forward until it hits a "decision point" requiring external input.
 /// </summary>
-public class RunSimulator
+public partial class RunSimulator
 {
     private static int? _expectedSaveSchemaVersion;
     private static bool _expectedSaveSchemaVersionReady;
@@ -293,7 +293,8 @@ public class RunSimulator
     private IReadOnlyList<IReadOnlyList<CardModel>>? _pendingBundles;
     private TaskCompletionSource<IEnumerable<CardModel>>? _pendingBundleTcs;
 
-    public Dictionary<string, object?> StartRun(string character, int ascension = 0, string? seed = null, string lang = "en")
+    public Dictionary<string, object?> StartRun(string character, int ascension = 0, string? seed = null, string lang = "en",
+        bool playedSave = false, string? act1 = null)
     {
         try
         {
@@ -305,16 +306,30 @@ public class RunSimulator
             if (_runState != null || RunManager.Instance.IsInProgress)
                 CleanUp();
 
-            var player = CreatePlayer(character);
+            var player = CreatePlayer(character, playedSave);
             if (player == null)
                 return Error($"Unknown character: {character}");
 
-            var seedStr = seed ?? "headless_" + DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var seedStr = OracleSeed(seed) ?? "headless_" + DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             Log($"Creating RunState with seed={seedStr}");
+
+            // Parity-oracle act-1 override (null = historical default list, unchanged).
+            IReadOnlyList<ActModel>? acts = null;
+            if (act1 != null)
+            {
+                var chosen = ResolveAct1(act1, seedStr, playedSave);
+                if (chosen == null)
+                    return Error($"Unknown act1: {act1} (expected overgrowth|underdocks|roll)");
+                var actList = ActModel.GetDefaultList().ToList();
+                actList[0] = chosen;
+                acts = actList;
+                Log($"Act 1 = {chosen.Id.Entry} (act1={act1})");
+            }
 
             // Use CreateForTest which properly handles mutable copies internally
             _runState = RunState.CreateForTest(
                 players: new[] { player },
+                acts: acts,
                 ascensionLevel: ascension,
                 seed: seedStr
             );
@@ -324,8 +339,10 @@ public class RunSimulator
             RunManager.Instance.SetUpTest(_runState, netService);
             LocalContext.NetId = netService.NetId;
 
-            // Force Neow event (blessing selection at start)
-            _runState.ExtraFields.StartedWithNeow = true;
+            // Force Neow event (blessing selection at start). A played_save run (parity oracle) keeps the flag the
+            // played-save UnlockState computed (NEOW_EPOCH obtained, not revealed -> no Neow), as in spire-mentor.
+            if (!playedSave)
+                _runState.ExtraFields.StartedWithNeow = true;
 
             // Generate rooms for all acts
             RunManager.Instance.GenerateRooms();
@@ -455,6 +472,15 @@ public class RunSimulator
                     // "BASH+" = upgraded Bash (deck snapshots from real runs include upgrades).
                     var upgraded = id.EndsWith("+");
                     if (upgraded) id = id.TrimEnd('+');
+                    else if (OracleMode && id.Contains('+'))
+                    {
+                        // spire-mentor scenario syntax "ID+1" (single-level upgrades only).
+                        var plus = id.IndexOf('+');
+                        if (!int.TryParse(id[(plus + 1)..], out var n) || n != 1)
+                            return Error($"bad upgrade suffix in card id '{id}': expected +1");
+                        id = id[..plus];
+                        upgraded = true;
+                    }
                     var canonical = ModelDb.GetById<CardModel>(new ModelId("CARD", id));
                     if (canonical != null)
                     {
@@ -1880,7 +1906,8 @@ public class RunSimulator
 
         // Self-targeting potions (Flex, Fortifier, etc.) ALWAYS target the player
         // regardless of any target_index the caller provides
-        if (potionTargetType == TargetType.Self || potionTargetType == TargetType.TargetedNoCreature)
+        if (potionTargetType == TargetType.Self || potionTargetType == TargetType.TargetedNoCreature
+            || (OracleMode && potionTargetType == TargetType.AnyPlayer))
         {
             target = player.Creature;
         }
@@ -1903,7 +1930,7 @@ public class RunSimulator
             {
                 var combatState = CombatManager.Instance.DebugOnlyGetState();
                 var alive = combatState?.Enemies?.Where(e => e != null && e.IsAlive).ToList() ?? new();
-                if (alive.Count == 1)
+                if (alive.Count == 1 || (alive.Count > 1 && OracleMode))
                     target = alive[0];
                 else if (alive.Count > 1)
                     return Error($"Potion {potion.Id.Entry} targets a single enemy (AnyEnemy); " +
@@ -2132,6 +2159,7 @@ public class RunSimulator
                 RunManager.Instance.EnterNextAct().GetAwaiter().GetResult();
                 WaitForActionExecutor();
                 HealBetweenActs();
+                if (OracleMode) OracleEnterActStartAncient();
                 return DetectDecisionPoint();
             }
         }
@@ -2829,6 +2857,7 @@ public class RunSimulator
                 _syncCtx.Pump();
                 WaitForActionExecutor();
                 HealBetweenActs();
+                if (OracleMode) OracleEnterActStartAncient();
             }
             catch (Exception ex) { Log($"EnterNextAct: {ex.Message}"); }
             return DetectDecisionPoint();
@@ -3617,15 +3646,16 @@ public class RunSimulator
         }
     }
 
-    private Player? CreatePlayer(string characterName)
+    private Player? CreatePlayer(string characterName, bool playedSave = false)
     {
+        var unlockState = BuildUnlockState(playedSave);
         return characterName.ToLowerInvariant() switch
         {
-            "ironclad" => Player.CreateForNewRun<Ironclad>(UnlockState.all, 1uL),
-            "silent" => Player.CreateForNewRun<Silent>(UnlockState.all, 1uL),
-            "defect" => Player.CreateForNewRun<Defect>(UnlockState.all, 1uL),
-            "regent" => Player.CreateForNewRun<Regent>(UnlockState.all, 1uL),
-            "necrobinder" => Player.CreateForNewRun<Necrobinder>(UnlockState.all, 1uL),
+            "ironclad" => Player.CreateForNewRun<Ironclad>(unlockState, 1uL),
+            "silent" => Player.CreateForNewRun<Silent>(unlockState, 1uL),
+            "defect" => Player.CreateForNewRun<Defect>(unlockState, 1uL),
+            "regent" => Player.CreateForNewRun<Regent>(unlockState, 1uL),
+            "necrobinder" => Player.CreateForNewRun<Necrobinder>(unlockState, 1uL),
             _ => null
         };
     }
