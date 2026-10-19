@@ -64,10 +64,9 @@ public partial class RunSimulator
             }
             actions.Add(new Dictionary<string, object?> { ["action"] = "end_turn" });
 
-            // Belt SLOT indices (empty slots keep their number): the harness and the Rust engine address potions by
-            // slot. 0.111.0's Player.Potions skips empty slots, so read PotionSlots; use_potion reads slots too in
-            // oracle mode.
-            var potions = player.PotionSlots?.ToList() ?? new();
+            // Compact potion index (Player.Potions, empty slots skipped) — the same index use_potion, discard_potion
+            // and the player summary use, as in the spire-mentor oracle.
+            var potions = player.Potions?.ToList() ?? new();
             for (int i = 0; i < potions.Count; i++)
             {
                 if (potions[i] == null) continue;
@@ -127,7 +126,7 @@ public partial class RunSimulator
             };
 
             var monsters = new List<Dictionary<string, object?>>();
-            var slots = OracleSlots(combatState);
+            var slots = combatState?.Enemies?.ToList();
             if (slots != null)
             {
                 for (int i = 0; i < slots.Count; i++)
@@ -559,50 +558,52 @@ public partial class RunSimulator
     /// <summary>
     /// Oracle mode: after a non-final boss, enter the next act's starting Ancient node so the boss-relic
     /// 1-of-3 choice is surfaced as event_choice (spire-mentor DetectPostCombatState; the Rust engine hoists
-    /// the same offer right after the boss card reward). Our HealBetweenActs already ran, so the Ancient's own
-    /// between-act heal is a no-op.
+    /// the same offer right after the boss card reward). The Ancient applies the between-act heal itself
+    /// (AncientEventModel.BeforeEventStarted), so the caller skips our HealBetweenActs on this path.
     /// </summary>
+    private bool OracleCanEnterActStartAncient()
+    {
+        var nextMap = _runState?.Map;
+        return nextMap?.StartingMapPoint != null
+            && nextMap.StartingMapPoint.PointType == MapPointType.Ancient
+            && _runState!.CurrentRoom is MapRoom;
+    }
+
     private void OracleEnterActStartAncient()
     {
         var nextMap = _runState?.Map;
-        if (nextMap?.StartingMapPoint != null
-            && nextMap.StartingMapPoint.PointType == MapPointType.Ancient
-            && _runState!.CurrentRoom is MapRoom)
+        if (nextMap?.StartingMapPoint != null && OracleCanEnterActStartAncient())
         {
             Log("Oracle mode: auto-entering act-start Ancient node for boss-relic choice");
             EnterRoomYielding(() => RunManager.Instance.EnterMapCoord(nextMap.StartingMapPoint.coord), "Act-start Ancient");
         }
     }
 
-    // 0.111.0 removes a dead enemy from CombatState._enemies (CreatureCmd.Kill -> CombatState.RemoveCreature);
-    // the 0.107.1 oracle contract emits every slot ever present with alive=false for the dead (uid = slot).
-    // Keep a per-combat slot roster: creatures stay at the position they were first seen; new ones (summons)
-    // are inserted after their predecessor in the live list.
-    private object? _oracleRosterCombat;
-    private List<MegaCrit.Sts2.Core.Entities.Creatures.Creature?>? _oracleRoster;
-
-    private List<MegaCrit.Sts2.Core.Entities.Creatures.Creature?>? OracleSlots(CombatState? combatState)
+    /// <summary>
+    /// Oracle mode, Winged Boots: while the relic's "Rooms" counter (remaining free-travel uses) is positive, the
+    /// whole next row is selectable (spire-mentor MapSelectState / WingedBootsMaxUses). Null = no change.
+    /// </summary>
+    private List<Dictionary<string, object?>>? OracleWingedBootsChoices(ActMap map, MapPoint currentPoint)
     {
-        if (combatState?.Enemies == null) { _oracleRosterCombat = null; _oracleRoster = null; return null; }
-        var live = combatState.Enemies.ToList();
-        if (!ReferenceEquals(_oracleRosterCombat, combatState) || _oracleRoster == null)
+        var boots = _runState?.Players?.FirstOrDefault()?.Relics?.FirstOrDefault(r => r.Id.Entry == "WINGED_BOOTS");
+        if (boots == null) return null;
+        int uses = 3;
+        try
         {
-            _oracleRosterCombat = combatState;
-            _oracleRoster = new List<MegaCrit.Sts2.Core.Entities.Creatures.Creature?>(live);
-            return _oracleRoster;
+            foreach (var dv in boots.DynamicVars.Values)
+                if (dv.Name == "Rooms") uses = (int)dv.BaseValue;
         }
-        for (int i = 0; i < live.Count; i++)
-        {
-            var c = live[i];
-            if (_oracleRoster.Contains(c)) continue;
-            int at = 0;
-            for (int j = i - 1; j >= 0; j--)
+        catch { }
+        if (uses <= 0) return null;
+        var row = (map.GetPointsInRow(currentPoint.coord.row + 1) ?? Enumerable.Empty<MapPoint>())
+            .Where(p => p != null)
+            .Select(p => new Dictionary<string, object?>
             {
-                int k = _oracleRoster.IndexOf(live[j]);
-                if (k >= 0) { at = k + 1; break; }
-            }
-            _oracleRoster.Insert(at, c);
-        }
-        return _oracleRoster;
+                ["col"] = (int)p.coord.col,
+                ["row"] = (int)p.coord.row,
+                ["type"] = p.PointType.ToString(),
+            })
+            .ToList();
+        return row.Count > 0 ? row : null;
     }
 }

@@ -1895,8 +1895,7 @@ public partial class RunSimulator
             return Error("use_potion requires 'potion_index'");
 
         var idx = Convert.ToInt32(args["potion_index"]);
-        // Oracle mode addresses the belt by slot (empty slots keep their index), like the parity harness.
-        var potionsList = OracleMode ? player.PotionSlots.ToList() : player.Potions?.ToList() ?? new();
+        var potionsList = player.Potions?.ToList() ?? new();
         if (idx < 0 || idx >= potionsList.Count) return Error($"Invalid potion index {idx}");
         var potion = potionsList[idx];
         if (potion == null) return Error($"No potion at index {idx}");
@@ -2159,8 +2158,8 @@ public partial class RunSimulator
                 }
                 RunManager.Instance.EnterNextAct().GetAwaiter().GetResult();
                 WaitForActionExecutor();
-                HealBetweenActs();
-                if (OracleMode) OracleEnterActStartAncient();
+                if (OracleMode && OracleCanEnterActStartAncient()) OracleEnterActStartAncient();
+                else HealBetweenActs();
                 return DetectDecisionPoint();
             }
         }
@@ -2181,10 +2180,11 @@ public partial class RunSimulator
 
         var player = _runState.Players[0];
 
-        // Check game over (death)
+        // Check game over (death). Oracle mode: a won run also ends with dead players; victory = the victory
+        // room (spire-mentor / NGameOverScreen convention).
         if (player.Creature != null && player.Creature.IsDead)
         {
-            return GameOverState(false);
+            return GameOverState(OracleMode && (_runState.CurrentRoom?.IsVictoryRoom ?? false));
         }
 
         // Check if there's a pending bundle selection (Scroll Boxes: pick 1 of N packs)
@@ -2440,6 +2440,7 @@ public partial class RunSimulator
                         ["type"] = child.PointType.ToString(),
                     })
                     .ToList();
+                if (OracleMode) choices = OracleWingedBootsChoices(map, currentPoint) ?? choices;
             }
         }
         else
@@ -2857,8 +2858,8 @@ public partial class RunSimulator
                 RunManager.Instance.EnterNextAct().GetAwaiter().GetResult();
                 _syncCtx.Pump();
                 WaitForActionExecutor();
-                HealBetweenActs();
-                if (OracleMode) OracleEnterActStartAncient();
+                if (OracleMode && OracleCanEnterActStartAncient()) OracleEnterActStartAncient();
+                else HealBetweenActs();
             }
             catch (Exception ex) { Log($"EnterNextAct: {ex.Message}"); }
             return DetectDecisionPoint();
