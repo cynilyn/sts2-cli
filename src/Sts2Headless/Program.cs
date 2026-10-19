@@ -249,6 +249,28 @@ class Program
             case "get_state":
                 return sim.GetState();
 
+            case "dump_rng_trace":
+            {
+                List<string>? only = null;
+                if (cmd.TryGetProperty("streams", out var st) && st.ValueKind == JsonValueKind.Array)
+                    only = st.EnumerateArray().Select(x => x.GetString() ?? "").ToList();
+                int n = cmd.TryGetProperty("n", out var nn) ? nn.GetInt32() : 10;
+                RunSimulator.TraceCall[]? sched = null;
+                if (cmd.TryGetProperty("schedule", out var sc) && sc.ValueKind == JsonValueKind.Array)
+                {
+                    var l = new List<RunSimulator.TraceCall>();
+                    foreach (var it in sc.EnumerateArray())
+                    {
+                        var args = it.TryGetProperty("args", out var aa) ? aa.EnumerateArray().Select(x => x.GetDouble()).ToArray() : Array.Empty<double>();
+                        var tc = RunSimulator.ParseTraceCall(it.GetProperty("call").GetString() ?? "", args);
+                        if (tc == null) return new Dictionary<string, object?> { ["type"] = "error", ["message"] = "bad schedule entry" };
+                        l.Add(tc);
+                    }
+                    sched = l.ToArray();
+                }
+                return sim.DumpRngTrace(only, n, sched);
+            }
+
             case "dump_rooms":
                 return sim.DumpRooms();
 
