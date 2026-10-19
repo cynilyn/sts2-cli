@@ -64,7 +64,10 @@ public partial class RunSimulator
             }
             actions.Add(new Dictionary<string, object?> { ["action"] = "end_turn" });
 
-            var potions = player.Potions?.ToList() ?? new();
+            // Belt SLOT indices (empty slots keep their number): the harness and the Rust engine address potions by
+            // slot. 0.111.0's Player.Potions skips empty slots, so read PotionSlots; use_potion reads slots too in
+            // oracle mode.
+            var potions = player.PotionSlots?.ToList() ?? new();
             for (int i = 0; i < potions.Count; i++)
             {
                 if (potions[i] == null) continue;
@@ -124,11 +127,12 @@ public partial class RunSimulator
             };
 
             var monsters = new List<Dictionary<string, object?>>();
-            if (combatState?.Enemies != null)
+            var slots = OracleSlots(combatState);
+            if (slots != null)
             {
-                for (int i = 0; i < combatState.Enemies.Count; i++)
+                for (int i = 0; i < slots.Count; i++)
                 {
-                    var e = combatState.Enemies[i];
+                    var e = slots[i];
                     if (e == null)
                     {
                         monsters.Add(new Dictionary<string, object?>
@@ -568,5 +572,37 @@ public partial class RunSimulator
             Log("Oracle mode: auto-entering act-start Ancient node for boss-relic choice");
             EnterRoomYielding(() => RunManager.Instance.EnterMapCoord(nextMap.StartingMapPoint.coord), "Act-start Ancient");
         }
+    }
+
+    // 0.111.0 removes a dead enemy from CombatState._enemies (CreatureCmd.Kill -> CombatState.RemoveCreature);
+    // the 0.107.1 oracle contract emits every slot ever present with alive=false for the dead (uid = slot).
+    // Keep a per-combat slot roster: creatures stay at the position they were first seen; new ones (summons)
+    // are inserted after their predecessor in the live list.
+    private object? _oracleRosterCombat;
+    private List<MegaCrit.Sts2.Core.Entities.Creatures.Creature?>? _oracleRoster;
+
+    private List<MegaCrit.Sts2.Core.Entities.Creatures.Creature?>? OracleSlots(CombatState? combatState)
+    {
+        if (combatState?.Enemies == null) { _oracleRosterCombat = null; _oracleRoster = null; return null; }
+        var live = combatState.Enemies.ToList();
+        if (!ReferenceEquals(_oracleRosterCombat, combatState) || _oracleRoster == null)
+        {
+            _oracleRosterCombat = combatState;
+            _oracleRoster = new List<MegaCrit.Sts2.Core.Entities.Creatures.Creature?>(live);
+            return _oracleRoster;
+        }
+        for (int i = 0; i < live.Count; i++)
+        {
+            var c = live[i];
+            if (_oracleRoster.Contains(c)) continue;
+            int at = 0;
+            for (int j = i - 1; j >= 0; j--)
+            {
+                int k = _oracleRoster.IndexOf(live[j]);
+                if (k >= 0) { at = k + 1; break; }
+            }
+            _oracleRoster.Insert(at, c);
+        }
+        return _oracleRoster;
     }
 }

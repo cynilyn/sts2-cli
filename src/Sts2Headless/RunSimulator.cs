@@ -1895,7 +1895,8 @@ public partial class RunSimulator
             return Error("use_potion requires 'potion_index'");
 
         var idx = Convert.ToInt32(args["potion_index"]);
-        var potionsList = player.Potions?.ToList() ?? new();
+        // Oracle mode addresses the belt by slot (empty slots keep their index), like the parity harness.
+        var potionsList = OracleMode ? player.PotionSlots.ToList() : player.Potions?.ToList() ?? new();
         if (idx < 0 || idx >= potionsList.Count) return Error($"Invalid potion index {idx}");
         var potion = potionsList[idx];
         if (potion == null) return Error($"No potion at index {idx}");
