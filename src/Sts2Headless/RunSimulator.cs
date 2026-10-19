@@ -2151,7 +2151,7 @@ public partial class RunSimulator
             if (combatRoom.IsPreFinished || !CombatManager.Instance.IsInProgress)
             {
                 // Final act boss → victory (same rule as DetectPostCombatState, #81).
-                if (_runState != null && _runState.CurrentActIndex >= 2)
+                if (!OracleMode && _runState != null && _runState.CurrentActIndex >= 2)
                 {
                     Log($"Final boss defeated via Proceed (Act {_runState.CurrentActIndex + 1}), reporting victory");
                     return GameOverState(true);
@@ -2159,7 +2159,7 @@ public partial class RunSimulator
                 RunManager.Instance.EnterNextAct().GetAwaiter().GetResult();
                 WaitForActionExecutor();
                 if (OracleMode && OracleCanEnterActStartAncient()) OracleEnterActStartAncient();
-                else HealBetweenActs();
+                else if (!(OracleMode && (_runState?.CurrentRoom?.IsVictoryRoom ?? false))) HealBetweenActs();
                 return DetectDecisionPoint();
             }
         }
@@ -2847,7 +2847,7 @@ public partial class RunSimulator
         // map_select. Report victory directly in that case.
         if (combatRoom.RoomType == RoomType.Boss)
         {
-            if (_runState != null && _runState.CurrentActIndex >= 2)
+            if (!OracleMode && _runState != null && _runState.CurrentActIndex >= 2)
             {
                 Log($"Final boss defeated (Act {_runState.CurrentActIndex + 1}), reporting victory");
                 return GameOverState(true);
@@ -2859,7 +2859,7 @@ public partial class RunSimulator
                 _syncCtx.Pump();
                 WaitForActionExecutor();
                 if (OracleMode && OracleCanEnterActStartAncient()) OracleEnterActStartAncient();
-                else HealBetweenActs();
+                else if (!(OracleMode && (_runState?.CurrentRoom?.IsVictoryRoom ?? false))) HealBetweenActs();
             }
             catch (Exception ex) { Log($"EnterNextAct: {ex.Message}"); }
             return DetectDecisionPoint();
